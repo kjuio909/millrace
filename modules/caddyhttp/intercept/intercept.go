@@ -97,26 +97,14 @@ var bufPool = sync.Pool{
 	},
 }
 
-// TODO: handle status code replacement
-//
 // EXPERIMENTAL: Subject to change or removal.
 type interceptedResponseHandler struct {
 	caddyhttp.ResponseRecorder
-	replacer     *caddy.Replacer
-	handler      caddyhttp.ResponseHandler
-	handlerIndex int
-	statusCode   int
-}
-
-// EXPERIMENTAL: Subject to change or removal.
-func (irh interceptedResponseHandler) WriteHeader(statusCode int) {
-	if irh.statusCode != 0 && (statusCode < 100 || statusCode >= 200) {
-		irh.ResponseRecorder.WriteHeader(irh.statusCode)
-
-		return
-	}
-
-	irh.ResponseRecorder.WriteHeader(statusCode)
+	replacer      *caddy.Replacer
+	handler       caddyhttp.ResponseHandler
+	handlerIndex  int
+	statusCode    int
+	statusCodeErr error
 }
 
 // EXPERIMENTAL: Subject to change or removal.
@@ -142,14 +130,17 @@ func (ir Intercept) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 			rec.handlerIndex = i
 
 			// if configured to only change the status code,
-			// do that then stream
+			// buffer the response so we can substitute the status
 			if statusCodeStr := rh.StatusCode.String(); statusCodeStr != "" {
 				sc, err := strconv.Atoi(repl.ReplaceAll(statusCodeStr, ""))
 				if err != nil {
+					rec.statusCodeErr = err
 					rec.statusCode = http.StatusInternalServerError
 				} else {
 					rec.statusCode = sc
 				}
+
+				return true
 			}
 
 			return rec.statusCode == 0
@@ -176,34 +167,87 @@ func (ir Intercept) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		c.Write(zap.Int("handler", rec.handlerIndex))
 	}
 
-	// response recorder doesn't create a new copy of the original headers, they're
-	// present in the original response writer
-	// create a new recorder to see if any response body from the new handler is present,
-	// if not, use the already buffered response body
-	recorder := caddyhttp.NewResponseRecorder(w, nil, nil)
-	if err := rec.handler.Routes.Compile(emptyHandler).ServeHTTP(recorder, r); err != nil {
+	// replace_status only: no routes to execute, just substitute the
+	// status code and write the buffered original response as-is
+	if rec.handler.Routes == nil {
+		// an invalid status code (e.g. from a bad placeholder) means we
+		// cannot honor the original response at all; strip the original
+		// response headers so the error response doesn't leak them, and
+		// discard the buffered body (1xx responses already sent to the
+		// client can't be retracted, but the final status will be 500)
+		if rec.statusCodeErr != nil {
+			clear(w.Header())
+			return caddyhttp.Error(http.StatusInternalServerError, rec.statusCodeErr)
+		}
+
+		if rec.statusCode == 0 {
+			w.WriteHeader(rec.Status())
+		} else {
+			w.WriteHeader(rec.statusCode)
+		}
+
+		if buf.Len() > 0 {
+			_, err := io.Copy(w, buf)
+
+			return err
+		}
+
+		return nil
+	}
+
+	// the response recorder doesn't create a new copy of the original headers,
+	// they're present in the original response writer; the routes we're about
+	// to execute replace the original response, so the original headers must
+	// not leak into their response (e.g. an original Content-Length would
+	// corrupt a replacement body of a different length); but keep a copy so
+	// the fallback handler can restore them if the routes don't produce a
+	// response of their own
+	originalHeaders := w.Header().Clone()
+	clear(w.Header())
+
+	// execute the routes configured for this response; the fallback handler
+	// writes the original response if the routes don't, so that handlers
+	// which only modify the response (e.g. the 'header' directive) don't
+	// accidentally discard it
+	if err := rec.handler.Routes.Compile(fallbackHandler(w, originalHeaders, rec.Status(), buf)).ServeHTTP(w, r); err != nil {
+		// the error handler chain will write its own response; restore the
+		// original headers so the response doesn't end up with none at all
+		restoreHeaders(w, originalHeaders)
 		return err
 	}
 
-	// no new response status and the status is not 0
-	if recorder.Status() == 0 && rec.Status() != 0 {
-		w.WriteHeader(rec.Status())
-	}
-
-	// no new response body and there is some in the original response
-	// TODO: what if the new response doesn't have a body by design?
-	// see: https://github.com/caddyserver/caddy/pull/6232#issue-2235224400
-	if recorder.Size() == 0 && buf.Len() > 0 {
-		_, err := io.Copy(w, buf)
-		return err
-	}
 	return nil
 }
 
-// this handler does nothing because everything we need is already buffered
-var emptyHandler caddyhttp.Handler = caddyhttp.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) error {
-	return nil
-})
+// restoreHeaders adds the headers from original back into w's header map,
+// without overwriting any headers that were set in the meantime.
+func restoreHeaders(w http.ResponseWriter, original http.Header) {
+	for field, values := range original {
+		if _, ok := w.Header()[field]; !ok {
+			w.Header()[field] = values
+		}
+	}
+}
+
+// fallbackHandler returns a handler that writes the buffered original
+// response (headers, status code and body) to w; it is used as the 'next'
+// handler for intercept routes so that routes which don't produce their
+// own response fall through to the original response. Headers set by the
+// routes take precedence over the original ones.
+func fallbackHandler(w http.ResponseWriter, original http.Header, status int, buf *bytes.Buffer) caddyhttp.Handler {
+	return caddyhttp.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) error {
+		restoreHeaders(w, original)
+		if status == 0 {
+			status = http.StatusOK
+		}
+		w.WriteHeader(status)
+		if buf.Len() > 0 {
+			_, err := io.Copy(w, buf)
+			return err
+		}
+		return nil
+	})
+}
 
 // UnmarshalCaddyfile sets up the handler from Caddyfile tokens. Syntax:
 //
