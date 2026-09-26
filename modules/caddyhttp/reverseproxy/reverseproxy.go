@@ -533,11 +533,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// we also extract the buffer so the retry loop can replay it
 	// from the beginning on each attempt. (see #6259, #7546, #7713)
 	var bufferedReqBody *bytes.Buffer
-	if clonedReq.Body != nil {
+	if clonedReq.Body != nil && clonedReq.Body != http.NoBody {
+		// if retries are enabled, a failed attempt may be replayed on
+		// another upstream, so make sure the whole body is buffered;
+		// this allows the request to be rebuilt identically (same
+		// metadata, byte sequence, and length) on each attempt, even
+		// if a previous upstream already consumed part or all of it
+		if h.retriesEnabled() {
+			if reqBodyBuf, ok := clonedReq.Body.(bodyReadCloser); !ok || reqBodyBuf.body != nil {
+				var readBytes int64
+				clonedReq.Body, readBytes = h.bufferedBody(clonedReq.Body, -1)
+				// the body is now fully buffered, so its exact length is
+				// known; pin it (as request_buffers does) so every attempt
+				// sends the same length
+				clonedReq.ContentLength = readBytes
+				clonedReq.Header.Set("Content-Length", strconv.FormatInt(readBytes, 10))
+			}
+		}
 		if reqBodyBuf, ok := clonedReq.Body.(bodyReadCloser); ok && reqBodyBuf.body == nil && reqBodyBuf.buf != nil {
 			bufferedReqBody = reqBodyBuf.buf
 			reqBodyBuf.buf = nil
 			clonedReq.Body = io.NopCloser(bytes.NewReader(bufferedReqBody.Bytes()))
+			// advertise that the body can be rewound, so both the
+			// transport and our own retry logic know the request is
+			// safe to replay on another upstream
+			clonedReq.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bufferedReqBody.Bytes())), nil
+			}
 			defer func() {
 				bufferedReqBody.Reset()
 				bufPool.Put(bufferedReqBody)
@@ -559,6 +581,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// from previous tries because of the nuances of load balancing & retries
 	var proxyErr error
 	var retries int
+	// upstreams already tried for this request; retries skip them so a
+	// failover advances through the pool in order instead of looping
+	// back to an upstream that just failed for this same request
+	triedUpstreams := make(map[string]struct{})
 	for {
 		// if the request body was buffered (and only the entire body, hence no body
 		// set to read from after the buffer), make reading from the body idempotent
@@ -570,7 +596,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 
 		var done bool
-		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, repl, reqHeader, reqHost, next)
+		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, triedUpstreams, repl, reqHeader, reqHost, next)
 		if done {
 			break
 		}
@@ -601,7 +627,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 // It returns true when the loop is done and should break; false otherwise. The error value returned should
 // be assigned to the proxyErr value for the next iteration of the loop (or the error handled after break).
 func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w http.ResponseWriter, proxyErr error, start time.Time, retries int,
-	repl *caddy.Replacer, reqHeader http.Header, reqHost string, next caddyhttp.Handler,
+	triedUpstreams map[string]struct{}, repl *caddy.Replacer, reqHeader http.Header, reqHost string, next caddyhttp.Handler,
 ) (bool, error) {
 	// get the updated list of upstreams
 	upstreams := h.Upstreams
@@ -633,8 +659,25 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 		}
 	}
 
-	// choose an available upstream
-	upstream := h.LoadBalancing.SelectionPolicy.Select(upstreams, r, w)
+	// choose an available upstream, preferring upstreams that have not
+	// been tried yet for this request, so that a retry fails over to the
+	// next upstream in the pool rather than repeating one that just
+	// failed; if every upstream was already tried (e.g. the retry budget
+	// exceeds the pool size), fall back to the full pool so selection
+	// policies that cycle keep their previous behavior
+	pool := upstreams
+	if len(triedUpstreams) > 0 {
+		untried := make(UpstreamPool, 0, len(upstreams))
+		for _, u := range upstreams {
+			if _, tried := triedUpstreams[u.Dial]; !tried {
+				untried = append(untried, u)
+			}
+		}
+		if len(untried) > 0 {
+			pool = untried
+		}
+	}
+	upstream := h.LoadBalancing.SelectionPolicy.Select(pool, r, w)
 	if upstream == nil {
 		if proxyErr == nil {
 			proxyErr = caddyhttp.Error(http.StatusServiceUnavailable, errNoUpstream)
@@ -644,6 +687,10 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 		}
 		return false, proxyErr
 	}
+
+	// remember this upstream for the rest of this request's retry loop,
+	// so a subsequent attempt does not select it again
+	triedUpstreams[upstream.Dial] = struct{}{}
 
 	// the dial address may vary per-request if placeholders are
 	// used, so perform those replacements here; the resulting
@@ -1028,6 +1075,12 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 			// (it's not automatically done by ResponseWriter.WriteHeader() for 1xx responses)
 			clear(h)
 
+			// note: no Flush here; flushing before the final response
+			// would implicitly commit a 200 status (see net/http's
+			// response.Flush), corrupting the final response; the
+			// provisional response is still delivered in order, ahead
+			// of the final response
+
 			return nil
 		},
 	}
@@ -1279,6 +1332,11 @@ func (h *Handler) finalizeResponse(
 		if c := logger.Check(zapcore.WarnLevel, "aborting with incomplete response"); c != nil {
 			c.Write(zap.Error(err))
 		}
+		// flush whatever was already written so the client receives the
+		// partial content that was produced before the failure; the
+		// connection is then aborted without completing the declared
+		// response, surfacing the transport error to the client
+		_ = http.NewResponseController(rw).Flush()
 		// no extra logging from stdlib
 		panic(http.ErrAbortHandler)
 	}
@@ -1312,6 +1370,22 @@ func (h *Handler) finalizeResponse(
 	}
 
 	return nil
+}
+
+// retriesEnabled reports whether the handler is configured to retry
+// failed requests, either by count or by duration.
+func (h *Handler) retriesEnabled() bool {
+	return h.LoadBalancing != nil &&
+		(h.LoadBalancing.Retries > 0 || h.LoadBalancing.TryDuration > 0)
+}
+
+// requestReplayable reports whether req can be re-sent to another upstream
+// exactly as it was: either it carries no body, or its body was buffered
+// (so GetBody can produce it again). A request whose body was already
+// consumed cannot be rebuilt byte-for-byte, so retrying it would deliver
+// a truncated or empty body to the next upstream.
+func requestReplayable(req *http.Request) bool {
+	return req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
 }
 
 // tryAgain takes the time that the handler was initially invoked,
@@ -1354,8 +1428,13 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 		// because its retry decision was already made in reverseProxy()
 		// when the response matchers were evaluated
 		if !isDialError && !isRetryableResponse && (!isHandlerError || !errors.Is(herr, errNoUpstream)) {
-			if lb.RetryMatch == nil && req.Method != "GET" {
-				// by default, don't retry requests if they aren't GET
+			// by default, only retry if the request can be replayed
+			// exactly as it was: the round trip failed before any final
+			// response was received, so nothing was written to the
+			// client yet, and as long as the request can be rebuilt
+			// (no body, or a buffered body) the next upstream will see
+			// the same request the first one did
+			if lb.RetryMatch == nil && !requestReplayable(req) {
 				return false
 			}
 
@@ -1636,6 +1715,20 @@ type LoadBalancing struct {
 	// request if the next available host is down. If try_duration is
 	// also configured, then retries may stop early if the duration
 	// is reached. By default, retries are disabled (zero).
+	//
+	// A retry only happens while no final response has been produced
+	// yet: if an upstream fails before the final response (e.g. the
+	// connection is lost, even after a 1xx provisional response), the
+	// request is replayed once on the next available upstream; if a
+	// final response has already started being written to the client,
+	// the already-produced content is kept and the connection ends
+	// with the transport error instead. Upstreams already tried for the
+	// request are skipped, so retries advance through the pool without
+	// looping.
+	//
+	// When retries are enabled, the request body is buffered so it can
+	// be rebuilt identically (same metadata, byte sequence, and
+	// length) on each attempt.
 	Retries int `json:"retries,omitempty"`
 
 	// How long to try selecting available backends for each request
@@ -1656,12 +1749,14 @@ type LoadBalancing struct {
 	// A list of matcher sets that controls retry behavior. Matcher sets
 	// without expression matchers (e.g. method, path) restrict which
 	// requests are retried on transport errors - if unspecified, only
-	// GET requests will be retried. Matcher sets with CEL expression
-	// matchers are evaluated against upstream responses and can
-	// reference {rp.status_code}, {rp.header.*}, and
-	// {rp.is_transport_error}. Dial errors are always retried
-	// regardless of this setting. Retries use the next available
-	// upstream per the load balancing policy
+	// requests that can be replayed identically (no body, or a buffered
+	// body, which is the case automatically when retries are enabled)
+	// will be retried. Matcher sets with CEL expression matchers are
+	// evaluated against upstream responses and can reference
+	// {rp.status_code}, {rp.header.*}, and {rp.is_transport_error}.
+	// Dial errors are always retried regardless of this setting.
+	// Retries use the next available upstream per the load balancing
+	// policy, skipping upstreams already tried for the request.
 	RetryMatchRaw caddyhttp.RawMatcherSets `json:"retry_match,omitempty" caddy:"namespace=http.matchers"`
 
 	SelectionPolicy Selector              `json:"-"`
