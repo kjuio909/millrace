@@ -329,11 +329,31 @@ func (ir Intercept) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		return nil
 	}
 
+	// collect the values of the original response's declared
+	// trailers; they are replayed after the final status is written
+	// so the server sends them as trailers instead of regular
+	// headers (see net/http's Trailer documentation)
+	var trailers http.Header
+	for _, v := range origHeader.Values("Trailer") {
+		for _, field := range strings.Split(v, ",") {
+			field = http.CanonicalHeaderKey(strings.TrimSpace(field))
+			if vals, ok := origHeader[field]; ok {
+				if trailers == nil {
+					trailers = make(http.Header)
+				}
+				trailers[field] = vals
+			}
+		}
+	}
+
 	// the routes did not write a response themselves (they typically
 	// only adjusted response headers); replay the original response
 	// headers, with headers the routes set taking precedence per field
 	dst := w.Header()
 	for field, vals := range origHeader {
+		if _, isTrailer := trailers[field]; isTrailer {
+			continue
+		}
 		dst[field] = vals
 	}
 	for field, vals := range rw.header {
@@ -345,6 +365,18 @@ func (ir Intercept) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		status = http.StatusOK
 	}
 	w.WriteHeader(status)
+
+	// the original response's trailer values are only restored now
+	// that the final status is written: the server emits the values
+	// of trailer-declared keys as trailers, but only if they are not
+	// already present in the header map when the status is written;
+	// routes that set such a field themselves take precedence
+	for field, vals := range trailers {
+		if _, ok := rw.header[field]; ok {
+			continue
+		}
+		dst[field] = vals
+	}
 
 	// HEAD responses, and other responses which declared a length
 	// without a body, keep the Content-Length from the original
