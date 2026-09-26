@@ -557,8 +557,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// in the proxy loop, each iteration is an attempt to proxy the request,
 	// and because we may retry some number of times, carry over the error
 	// from previous tries because of the nuances of load balancing & retries
+	//
+	// triedUpstreams tracks the upstreams that have already been selected for
+	// this request and failed before producing a final response. It is scoped
+	// to this single client request only: it ensures a retry lands on a
+	// different upstream (selection policies such as random or round_robin do
+	// not guarantee that on their own, and "first" would otherwise re-select
+	// the same first upstream forever), and never leaks state between
+	// requests.
 	var proxyErr error
 	var retries int
+	triedUpstreams := make(map[string]struct{})
 	for {
 		// if the request body was buffered (and only the entire body, hence no body
 		// set to read from after the buffer), make reading from the body idempotent
@@ -570,7 +579,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 
 		var done bool
-		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, repl, reqHeader, reqHost, next)
+		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, repl, reqHeader, reqHost, next, triedUpstreams)
 		if done {
 			break
 		}
@@ -601,7 +610,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 // It returns true when the loop is done and should break; false otherwise. The error value returned should
 // be assigned to the proxyErr value for the next iteration of the loop (or the error handled after break).
 func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w http.ResponseWriter, proxyErr error, start time.Time, retries int,
-	repl *caddy.Replacer, reqHeader http.Header, reqHost string, next caddyhttp.Handler,
+	repl *caddy.Replacer, reqHeader http.Header, reqHost string, next caddyhttp.Handler, triedUpstreams map[string]struct{},
 ) (bool, error) {
 	// get the updated list of upstreams
 	upstreams := h.Upstreams
@@ -633,8 +642,10 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 		}
 	}
 
-	// choose an available upstream
-	upstream := h.LoadBalancing.SelectionPolicy.Select(upstreams, r, w)
+	// choose an available upstream; upstreams already attempted for this
+	// request are excluded so that a retry is served by a different
+	// upstream, regardless of selection policy
+	upstream := h.selectUpstream(upstreams, r, w, repl, triedUpstreams)
 	if upstream == nil {
 		if proxyErr == nil {
 			proxyErr = caddyhttp.Error(http.StatusServiceUnavailable, errNoUpstream)
@@ -720,12 +731,59 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 		h.countFailure(upstream)
 	}
 
+	// exclude this upstream from any further attempt for the same
+	// client request, so a retry moves to a different upstream
+	// rather than being served by the one that just failed
+	triedUpstreams[dialInfo.Address] = struct{}{}
+
 	// if we've tried long enough, break
 	if !h.LoadBalancing.tryAgain(h.ctx, start, retries, proxyErr, r, h.logger) {
 		return true, proxyErr
 	}
 
 	return false, proxyErr
+}
+
+// selectUpstream applies the configured selection policy to pool, preferring
+// upstreams that have not already been attempted for the current request
+// (keyed by their resolved dial address). This keeps retry semantics
+// independent of the policy: for example, "first" would otherwise re-select
+// the same first upstream on every attempt, and random or round_robin
+// policies do not promise a different upstream either. The exclusion set is
+// per-request and carries no health state, so it never affects subsequent
+// client requests.
+//
+// If every available upstream has already been attempted, the unfiltered
+// policy is used as a fallback; the retry limit (and/or try duration) remains
+// responsible for deciding when to stop, preserving the previous behaviour
+// for pools with a single upstream.
+func (h *Handler) selectUpstream(pool UpstreamPool, r *http.Request, w http.ResponseWriter,
+	repl *caddy.Replacer, triedUpstreams map[string]struct{},
+) *Upstream {
+	policy := h.LoadBalancing.SelectionPolicy
+	if len(triedUpstreams) == 0 {
+		return policy.Select(pool, r, w)
+	}
+	candidates := make(UpstreamPool, 0, len(pool))
+	for _, u := range pool {
+		// resolve the same dial address that proxyLoopIteration uses
+		// below; an unresolvable address is left in as a candidate so
+		// that its existing, terminal configuration error is surfaced
+		di, err := u.fillDialInfo(repl)
+		if err != nil {
+			candidates = append(candidates, u)
+			continue
+		}
+		if _, tried := triedUpstreams[di.Address]; !tried {
+			candidates = append(candidates, u)
+		}
+	}
+	if len(candidates) == 0 {
+		// all available upstreams were already attempted; fall back to
+		// the unfiltered pool and let the retry budget terminate the loop
+		candidates = pool
+	}
+	return policy.Select(candidates, r, w)
 }
 
 // Mapping of the canonical form of the headers, to the RFC 6455 form,

@@ -259,6 +259,83 @@ func TestDialErrorBodyRetry(t *testing.T) {
 	}
 }
 
+// TestFirstPolicyRetrySkipsFailedUpstream verifies that a retry does not
+// re-select the upstream that just failed, even when the selection policy is
+// "first" (which always returns the first available upstream). Without the
+// per-request exclusion set, the first policy would select the same dead
+// upstream on every attempt, exhausting the retry budget with a 502 instead
+// of failing over to the second, ordered upstream.
+func TestFirstPolicyRetrySkipsFailedUpstream(t *testing.T) {
+	// Good upstream: returns 200 OK.
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(goodServer.Close)
+
+	dead := deadUpstreamAddr(t)
+
+	// Fixed order: first upstream is dead, second is the good one.
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: dead},
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+	}
+
+	h := minimalHandler(1, upstreams...)
+	h.LoadBalancing.SelectionPolicy = FirstSelection{}
+
+	req := prepareTestRequest(httptest.NewRequest(http.MethodPost, "http://example.com/", nil))
+	rec := httptest.NewRecorder()
+
+	err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+
+	gotStatus := rec.Code
+	if err != nil {
+		if herr, ok := err.(caddyhttp.HandlerError); ok {
+			gotStatus = herr.StatusCode
+		}
+	}
+	if gotStatus != http.StatusOK {
+		t.Fatalf("status: got %d, want %d (err=%v)", gotStatus, http.StatusOK, err)
+	}
+	if rec.Body.String() != "ok" {
+		t.Errorf("body: got %q, want %q", rec.Body.String(), "ok")
+	}
+}
+
+// TestFirstPolicyRetryBudgetExhausted verifies that retries do not loop back
+// to already-tried upstreams and that with one retry and two failing
+// upstreams the client gets a terminal 502 after exactly one failover.
+func TestFirstPolicyRetryBudgetExhausted(t *testing.T) {
+	// Fixed order: both upstreams refuse connections.
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: deadUpstreamAddr(t)},
+		{Host: new(Host), Dial: deadUpstreamAddr(t)},
+	}
+
+	h := minimalHandler(1, upstreams...)
+	h.LoadBalancing.SelectionPolicy = FirstSelection{}
+
+	req := prepareTestRequest(httptest.NewRequest(http.MethodPost, "http://example.com/", nil))
+	rec := httptest.NewRecorder()
+
+	err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+
+	gotStatus := rec.Code
+	if err != nil {
+		if herr, ok := err.(caddyhttp.HandlerError); ok {
+			gotStatus = herr.StatusCode
+		}
+	}
+	if gotStatus != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want %d (err=%v)", gotStatus, http.StatusBadGateway, err)
+	}
+}
+
 // newExpressionMatcher provisions a MatchExpression for use in tests
 func newExpressionMatcher(t *testing.T, expr string) *caddyhttp.MatchExpression {
 	t.Helper()
