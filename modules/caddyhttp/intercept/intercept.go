@@ -334,6 +334,11 @@ func (ir Intercept) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// headers, with headers the routes set taking precedence per field
 	dst := w.Header()
 	for field, vals := range origHeader {
+		// TrailerPrefix magic keys are not regular headers;
+		// replayTrailerVals decides which of them survive
+		if strings.HasPrefix(field, http.TrailerPrefix) {
+			continue
+		}
 		dst[field] = vals
 	}
 	for field, vals := range rw.header {
@@ -344,17 +349,137 @@ func (ir Intercept) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	if status == 0 {
 		status = http.StatusOK
 	}
+
+	// replay the original trailers: reverse_proxy sets their values
+	// under the plain field name after the headers have already been
+	// written (and handlers may instead use the TrailerPrefix magic
+	// keys). Plain values must not leak as regular headers, so the
+	// trailer fields are re-attached through the magic prefix.
+	isHead := r.Method == http.MethodHead
+	trailerVals := replayTrailerVals(dst, origHeader, rw.header, isHead)
+
 	w.WriteHeader(status)
 
 	// HEAD responses, and other responses which declared a length
 	// without a body, keep the Content-Length from the original
 	// response rather than copying a body they don't have
-	if r.Method == http.MethodHead || (buf.Len() == 0 && origContentLength != "") {
+	if isHead || (buf.Len() == 0 && origContentLength != "") {
 		return nil
+	}
+
+	// trailers require chunked framing on HTTP/1.1, so force the
+	// headers (and chunked encoding) out before the body when the
+	// replayed response carries trailer values, mirroring
+	// reverse_proxy; without this net/http could commit to a
+	// Content-Length framing that cannot carry trailers
+	if len(trailerVals) > 0 {
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			return err
+		}
 	}
 
 	_, err := buf.WriteTo(w)
 	return err
+}
+
+// replayTrailerVals re-attaches the original response's trailer
+// values onto dst using the http.TrailerPrefix magic keys, so the
+// net/http server emits them in the chunked trailer section rather
+// than as regular response headers.
+//
+// A field is trailer space for the original response if it was
+// announced in its "Trailer" header or if its value was set with a
+// magic-prefix key. Such a field is replayed as a trailer only while
+// the final response still announces it (magic-prefix trailers need
+// no announcement); if the declaration was removed or changed, the
+// value is dropped instead of leaking as a regular header. Fields a
+// route explicitly set as regular headers, or magic-prefix keys a
+// route itself set, are left to the route.
+//
+// For HEAD requests the values are stripped but never re-attached:
+// HEAD responses carry neither a body nor a trailer section, while
+// the Trailer declaration and length semantics are left intact.
+//
+// EXPERIMENTAL: Subject to change or removal.
+func replayTrailerVals(dst, orig, route http.Header, isHead bool) map[string][]string {
+	trailerFields := make(map[string]bool)
+	for _, decl := range orig.Values("Trailer") {
+		for _, field := range splitHeaderFieldList(decl) {
+			trailerFields[http.CanonicalHeaderKey(field)] = true
+		}
+	}
+	magicFields := make(map[string]bool)
+	for field := range orig {
+		if name, ok := strings.CutPrefix(field, http.TrailerPrefix); ok {
+			trailerFields[http.CanonicalHeaderKey(name)] = true
+			magicFields[http.CanonicalHeaderKey(name)] = true
+		}
+	}
+
+	announced := make(map[string]bool)
+	for _, decl := range dst.Values("Trailer") {
+		for _, field := range splitHeaderFieldList(decl) {
+			announced[http.CanonicalHeaderKey(field)] = true
+		}
+	}
+
+	vals := make(map[string][]string)
+	for field := range trailerFields {
+		// a route that sets this field as a regular header, or
+		// sets it through a magic-prefix key itself, owns it
+		if _, ok := route[field]; ok {
+			continue
+		}
+		if _, ok := route[http.TrailerPrefix+field]; ok {
+			continue
+		}
+
+		// magic-prefix trailers are emitted without a Trailer
+		// declaration; plain-named ones must still be announced
+		if !magicFields[field] && !announced[field] {
+			dst.Del(field)
+			continue
+		}
+
+		vv := append(append([]string{}, orig[http.TrailerPrefix+field]...), orig[field]...)
+		if len(vv) == 0 {
+			continue
+		}
+		// the field occupied trailer space, never the regular
+		// response header block
+		dst.Del(field)
+		vals[field] = vv
+	}
+
+	for field, vv := range vals {
+		// trailers require chunked framing and never coexist with
+		// a Content-Length (see chunkWriter in net/http); drop it
+		// for HEAD too so its length semantics match the chunked
+		// GET
+		dst.Del("Content-Length")
+		if isHead {
+			// HEAD carries no body and therefore no trailer
+			// section: keep the declaration but withhold values
+			continue
+		}
+		dst[http.TrailerPrefix+field] = vv
+	}
+	return vals
+}
+
+// splitHeaderFieldList splits a comma-separated header field list
+// such as the value of a Trailer header into trimmed, non-empty
+// elements.
+//
+// EXPERIMENTAL: Subject to change or removal.
+func splitHeaderFieldList(value string) []string {
+	var fields []string
+	for _, field := range strings.Split(value, ",") {
+		if field = strings.TrimSpace(field); field != "" {
+			fields = append(fields, field)
+		}
+	}
+	return fields
 }
 
 // isolatedHeaderWriter presents a response handler chain with its
