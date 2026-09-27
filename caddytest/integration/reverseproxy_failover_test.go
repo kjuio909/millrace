@@ -26,6 +26,7 @@ type recordedRequest struct {
 	contentLength int64
 	contentType   string
 	xTrace        string
+	bodyBytes     int
 	body          []byte
 }
 
@@ -190,6 +191,7 @@ func (u *failoverUpstream) handle(w http.ResponseWriter, r *http.Request) {
 				contentLength: r.ContentLength,
 				contentType:   r.Header.Get("Content-Type"),
 				xTrace:        r.Header.Get("X-Trace"),
+				bodyBytes:     len(body),
 				body:          body,
 			})
 			u.mu.Unlock()
