@@ -1412,8 +1412,8 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 		// because its retry decision was already made in reverseProxy()
 		// when the response matchers were evaluated
 		if !isDialError && !isRetryableResponse && (!isHandlerError || !errors.Is(herr, errNoUpstream)) {
-			if lb.RetryMatch == nil && req.Method != "GET" {
-				// by default, don't retry requests if they aren't GET
+			if lb.RetryMatch == nil && req.Method != "GET" && req.Method != "HEAD" {
+				// by default, don't retry requests if they aren't GET or HEAD
 				return false
 			}
 
@@ -1714,7 +1714,7 @@ type LoadBalancing struct {
 	// A list of matcher sets that controls retry behavior. Matcher sets
 	// without expression matchers (e.g. method, path) restrict which
 	// requests are retried on transport errors - if unspecified, only
-	// GET requests will be retried. Matcher sets with CEL expression
+	// GET or HEAD requests will be retried. Matcher sets with CEL expression
 	// matchers are evaluated against upstream responses and can
 	// reference {rp.status_code}, {rp.header.*}, and
 	// {rp.is_transport_error}. Dial errors are always retried

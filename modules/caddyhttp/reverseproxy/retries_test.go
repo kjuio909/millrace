@@ -642,6 +642,62 @@ func TestRequestOnlyMatcherDoesNotRetryResponses(t *testing.T) {
 	}
 }
 
+// TestDefaultRetryMethodsGetAndHead verifies that GET and HEAD requests obey
+// the same retry determination when no lb_retry_match is configured: both are
+// idempotent, so a transport error (not a dial error) is retried for either,
+// while other methods such as POST are not retried by default.
+func TestDefaultRetryMethodsGetAndHead(t *testing.T) {
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "2")
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write([]byte("ok"))
+		}
+	}))
+	t.Cleanup(goodServer.Close)
+
+	tests := []struct {
+		name       string
+		method     string
+		wantStatus int
+	}{
+		{"GET retried after transport error", http.MethodGet, http.StatusOK},
+		{"HEAD retried after transport error", http.MethodHead, http.StatusOK},
+		{"POST not retried after transport error", http.MethodPost, http.StatusBadGateway},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// RoundRobin picks index 1 first (broken), then 0 (good)
+			upstreams := []*Upstream{
+				{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+				{Host: new(Host), Dial: brokenUpstreamAddr(t)},
+			}
+
+			// RetryMatch intentionally nil: the default method-based
+			// retry decision is what is being tested here
+			h := minimalHandler(1, upstreams...)
+
+			req := prepareTestRequest(httptest.NewRequest(tc.method, "http://example.com/", nil))
+			rec := httptest.NewRecorder()
+
+			err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				return nil
+			}))
+
+			gotStatus := rec.Code
+			if err != nil {
+				if herr, ok := err.(caddyhttp.HandlerError); ok {
+					gotStatus = herr.StatusCode
+				}
+			}
+			if gotStatus != tc.wantStatus {
+				t.Errorf("status: got %d, want %d (err=%v)", gotStatus, tc.wantStatus, err)
+			}
+		})
+	}
+}
+
 // brokenUpstreamAddr returns the address of a TCP listener that accepts
 // connections but immediately closes them, causing a transport error (not
 // a dial error). This simulates an upstream that is reachable but broken
