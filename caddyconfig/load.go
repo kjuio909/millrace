@@ -17,6 +17,7 @@ package caddyconfig
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"io"
 	"mime"
@@ -113,6 +114,19 @@ func (adminLoad) handleLoad(w http.ResponseWriter, r *http.Request) error {
 
 	forceReload := r.Header.Get("Cache-Control") == "must-revalidate"
 
+	// Reject anything that is not a single, complete JSON config object
+	// before touching the running configuration. This ensures that a
+	// malformed submission (truncated JSON, trailing data, a non-object
+	// value, or an empty body) can never unload or partially replace the
+	// last successfully-loaded config; decoding into jsontext.Value only
+	// validates the syntax and shape without interpreting any fields.
+	if err := validateConfigJSON(body); err != nil {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("decoding config: %v", err),
+		}
+	}
+
 	err = caddy.Load(body, forceReload)
 	if err != nil {
 		return caddy.APIError{
@@ -172,6 +186,25 @@ func (adminLoad) handleAdapt(w http.ResponseWriter, r *http.Request) error {
 
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(out)
+}
+
+// validateConfigJSON reports an error unless body consists of exactly
+// one complete JSON object. It only validates syntax and shape; field
+// names and values are not interpreted, so an unknown or semantically
+// invalid config is left for the regular load path to reject. Decoding
+// into a map of jsontext.Value accepts any JSON value for each field
+// while ensuring the top-level value is an object (a JSON null, which
+// unmarshals to a nil map, or any non-object value is rejected), and
+// also rejects truncated input or data appended after the first value.
+func validateConfigJSON(body []byte) error {
+	var obj map[string]jsontext.Value
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return err
+	}
+	if obj == nil {
+		return fmt.Errorf("config must be a JSON object")
+	}
+	return nil
 }
 
 // adaptByContentType adapts body to Caddy JSON using the adapter specified by contentType.
