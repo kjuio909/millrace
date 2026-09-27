@@ -387,6 +387,20 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		// defaulting to a sane wait period between attempts
 		h.LoadBalancing.TryInterval = caddy.Duration(250 * time.Millisecond)
 	}
+
+	// When a retry budget is configured, a request may be replayed against a
+	// different upstream after the first attempt already consumed (part of)
+	// the request body - e.g. when the connection is dropped while the body
+	// is being written, after an interim response, or after a response that
+	// matched retry_match. A body read once from the downstream client cannot
+	// be read a second time, so buffer it fully before the first attempt and
+	// replay the same bytes (and length) on every attempt. Only do this when
+	// request buffering was not configured explicitly (including transports
+	// such as FastCGI that provide their own default buffer size).
+	if h.RequestBuffers == 0 && h.LoadBalancing.retryEnabled() {
+		h.RequestBuffers = -1
+	}
+
 	lbMatcherSets, err := ctx.LoadModule(h.LoadBalancing, "RetryMatchRaw")
 	if err != nil {
 		return err
@@ -569,6 +583,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	var retries int
 	triedUpstreams := make(map[string]struct{})
 	for {
+		// a new attempt must never be started once the whole-attempt time
+		// limit has elapsed; this gate is the authoritative deadline check
+		// for starting attempts (tryAgain caps the wait between them)
+		if retries > 0 && h.LoadBalancing.TryDuration > 0 &&
+			time.Since(start) >= time.Duration(h.LoadBalancing.TryDuration) {
+			break
+		}
+
 		// if the request body was buffered (and only the entire body, hence no body
 		// set to read from after the buffer), make reading from the body idempotent
 		// and reusable, so if a backend partially or fully reads the body but then
@@ -839,7 +861,11 @@ func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.
 	// attacks, so it is strongly recommended to only use this
 	// feature if absolutely required, if read timeouts are
 	// set, and if body size is limited
-	if h.RequestBuffers != 0 && req.Body != nil {
+	//
+	// ContentLength == 0 means there is provably no body (GET, HEAD and
+	// empty POSTs), so skip the buffer allocation entirely; a negative
+	// ContentLength (chunked/streamed) still has to be buffered.
+	if h.RequestBuffers != 0 && req.Body != nil && req.ContentLength != 0 {
 		var readBytes int64
 		req.Body, readBytes = h.bufferedBody(req.Body, h.RequestBuffers)
 		// set Content-Length when body is fully buffered
@@ -1372,6 +1398,14 @@ func (h *Handler) finalizeResponse(
 	return nil
 }
 
+// retryEnabled reports whether any retry budget (a maximum number of
+// retries and/or a whole-attempt time limit) is configured. When true,
+// requests may be replayed on a different upstream, so request bodies must
+// be buffered to allow an exact replay.
+func (lb LoadBalancing) retryEnabled() bool {
+	return lb.Retries > 0 || lb.TryDuration > 0
+}
+
 // tryAgain takes the time that the handler was initially invoked,
 // the amount of retries already performed, as well as any error
 // currently obtained, and the request being tried, and returns
@@ -1442,9 +1476,26 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 	}
 
 	// otherwise, wait and try the next available host
-	timer := time.NewTimer(time.Duration(lb.TryInterval))
+	wait := time.Duration(lb.TryInterval)
+	if lb.TryDuration > 0 {
+		// do not sleep past the whole-attempt time limit: cap the wait at the
+		// remaining budget so a deadline reached while between attempts never
+		// starts a new attempt
+		if remaining := time.Duration(lb.TryDuration) - time.Since(start); remaining <= 0 {
+			return false
+		} else if remaining < wait {
+			wait = remaining
+		}
+	}
+	timer := time.NewTimer(wait)
 	select {
 	case <-timer.C:
+		// re-check the whole-attempt time limit after waiting: the interval
+		// may have carried us exactly to (or past) the deadline, in which
+		// case a new attempt must not be started
+		if lb.TryDuration > 0 && time.Since(start) >= time.Duration(lb.TryDuration) {
+			return false
+		}
 		return true
 	case <-ctx.Done():
 		if !timer.Stop() {
@@ -1694,6 +1745,11 @@ type LoadBalancing struct {
 	// request if the next available host is down. If try_duration is
 	// also configured, then retries may stop early if the duration
 	// is reached. By default, retries are disabled (zero).
+	//
+	// Enabling a retry budget (Retries > 0 or TryDuration > 0) also
+	// buffers the whole request body in memory when request_buffers is
+	// not set explicitly, so a request can be replayed exactly on a
+	// different upstream after the first attempt failed.
 	Retries int `json:"retries,omitempty"`
 
 	// How long to try selecting available backends for each request

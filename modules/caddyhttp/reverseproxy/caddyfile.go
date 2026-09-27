@@ -69,6 +69,11 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    lb_try_interval <interval>
 //	    lb_retry_match <matcher>
 //
+// Enabling retries (lb_retries and/or lb_try_duration) buffers the whole
+// request body in memory automatically, so a request can be replayed
+// byte-for-byte on a different upstream after the first attempt failed;
+// set request_buffers explicitly to cap the buffered size if needed.
+//
 //	    # active health checking
 //	    health_uri          <uri>
 //	    health_port         <port>

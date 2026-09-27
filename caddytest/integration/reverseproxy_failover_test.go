@@ -291,7 +291,6 @@ func failoverSiteBlocks(firstAddr, backupAddr string) string {
 			lb_retries 1
 			lb_try_duration 1s
 			lb_try_interval 25ms
-			request_buffers unlimited
 			lb_retry_match {
 				expression `+"`{rp.is_transport_error} == true`"+`
 			}
@@ -935,4 +934,99 @@ func mustNewRequest(t *testing.T, method, url string) *http.Request {
 		t.Fatal(err)
 	}
 	return req
+}
+
+// TestReverseProxyFailoverDeadlineBetweenAttempts verifies the whole-attempt
+// time limit governs the time spent *between* attempts, not just the time of
+// the attempts themselves: when the first node fails immediately and the
+// configured retry interval is longer than the remaining try duration, the
+// wait is capped at the deadline and, once the deadline is reached, no new
+// attempt is started - the backup is never contacted and the client gets a
+// single 502 promptly (well before the full interval would have elapsed).
+// The identical check runs over HTTP/1.1 and HTTP/2 over TLS.
+func TestReverseProxyFailoverDeadlineBetweenAttempts(t *testing.T) {
+	first := newFailoverUpstream(t, "first")
+	backup := newFailoverUpstream(t, "backup")
+
+	const tryDuration = 60 * time.Millisecond
+	blocks := fmt.Sprintf(`
+	reverse_proxy %s %s {
+		lb_policy first
+		lb_retries 2
+		lb_try_duration %s
+		lb_try_interval 1s
+		lb_retry_match {
+			expression `+"`{rp.is_transport_error} == true`"+`
+		}
+	}
+	`, first.addr(), backup.addr(), tryDuration)
+
+	tester := caddytest.NewTester(t)
+	tester.InitServer(fmt.Sprintf(`
+	{
+		skip_install_trust
+		admin localhost:2999
+		http_port 9084
+		https_port 9447
+		grace_period 1ns
+	}
+	http://127.0.0.1:9084 {
+%s
+	}
+	https://localhost:9447 {
+		tls internal
+%s
+	}
+	`, blocks, blocks), "caddyfile")
+
+	for _, tc := range []struct {
+		name      string
+		baseURL   string
+		h2        bool
+		wantProto int
+	}{
+		{name: "HTTP/1.1", baseURL: "http://127.0.0.1:9084", h2: false, wantProto: 1},
+		{name: "HTTP/2 over TLS", baseURL: "https://localhost:9447", h2: true, wantProto: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newFailoverClient(tc.h2)
+			baseFirst := first.hitCount("/retry-before")
+			baseBackup := backup.hitCount("/retry-before")
+
+			start := time.Now()
+			resp, interim, _ := tracedDo(t, client, mustNewRequest(t, http.MethodGet, tc.baseURL+"/retry-before"))
+			elapsed := time.Since(start)
+			body, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			requireProtocol(t, resp, tc.wantProto)
+
+			if len(interim) != 0 {
+				t.Errorf("interim responses: got %v, want none", interim)
+			}
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("status: got %d, want 502", resp.StatusCode)
+			}
+			if readErr != nil {
+				t.Errorf("502 body should read cleanly: %v", readErr)
+			}
+			if len(body) != 0 {
+				t.Errorf("502 body: got %q, want empty", body)
+			}
+			if got := first.hitCount("/retry-before") - baseFirst; got != 1 {
+				t.Errorf("first upstream hits: got %d new, want 1", got)
+			}
+			if got := backup.hitCount("/retry-before") - baseBackup; got != 0 {
+				t.Errorf("backup upstream must not be attempted once the try duration elapsed during the interval, got %d new hits", got)
+			}
+			// the wait must be capped at the ~60ms remaining budget, not the
+			// configured 1s interval; and the request must return near that
+			// deadline rather than after a full second
+			if elapsed < tryDuration {
+				t.Errorf("request returned after %v, want at least the try duration %v", elapsed, tryDuration)
+			}
+			if elapsed >= 500*time.Millisecond {
+				t.Errorf("request returned after %v, want it capped near the %v deadline (not the 1s interval)", elapsed, tryDuration)
+			}
+		})
+	}
 }

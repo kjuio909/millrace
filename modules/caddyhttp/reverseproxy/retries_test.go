@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -860,5 +861,257 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	expectedBody := "hello world"
 	if rec.Body.String() != expectedBody {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
+	}
+}
+
+// bodyConsumingUpstream starts an HTTP server that fully receives (consumes)
+// the request body and then hijacks the connection and closes it without
+// sending any response. Unlike a refused dial, the request body has already
+// been read off the wire, so a retry can only replay it if the proxy
+// buffered it beforehand.
+func bodyConsumingUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		conn.Close()
+	}))
+}
+
+// noopNext is a terminal handler used in ServeHTTP tests.
+func noopNext(_ http.ResponseWriter, _ *http.Request) error { return nil }
+
+// TestRetryEnabledDecision pins the rule that enables request body
+// buffering automatically: a retry budget exists when either a positive
+// number of retries or a whole-attempt time limit is configured.
+func TestRetryEnabledDecision(t *testing.T) {
+	for i, tc := range []struct {
+		name string
+		lb   LoadBalancing
+		want bool
+	}{
+		{name: "no budget", lb: LoadBalancing{}, want: false},
+		{name: "retries only", lb: LoadBalancing{Retries: 1}, want: true},
+		{name: "try duration only", lb: LoadBalancing{TryDuration: caddy.Duration(time.Second)}, want: true},
+		{name: "both", lb: LoadBalancing{Retries: 2, TryDuration: caddy.Duration(time.Second)}, want: true},
+	} {
+		if got := tc.lb.retryEnabled(); got != tc.want {
+			t.Errorf("%d (%s): retryEnabled = %v, want %v", i, tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestTryDurationDeadlineBetweenAttempts verifies that once the
+// whole-attempt time limit has elapsed, tryAgain refuses another attempt
+// even if the retry count has not been exhausted and an interval is set.
+func TestTryDurationDeadlineBetweenAttempts(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	t.Cleanup(cancel)
+
+	lb := LoadBalancing{
+		Retries:     10,
+		TryDuration: caddy.Duration(50 * time.Millisecond),
+		// an interval larger than the remaining budget must never push a
+		// new attempt past the deadline
+		TryInterval: caddy.Duration(time.Hour),
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", nil)
+
+	// deadline already in the past: stop immediately without a long wait
+	startInPast := time.Now().Add(-100 * time.Millisecond)
+	start := time.Now()
+	if lb.tryAgain(caddyCtx, startInPast, 1, DialError{}, req, zap.NewNop()) {
+		t.Errorf("tryAgain after the deadline elapsed = true, want false")
+	}
+
+	// from now, the wait must be capped at the remaining ~50ms (not the
+	// configured hour), after which the deadline is reached and no new
+	// attempt may start
+	begin := time.Now()
+	if lb.tryAgain(caddyCtx, start, 1, DialError{}, req, zap.NewNop()) {
+		t.Errorf("tryAgain after waiting up to the deadline = true, want false")
+	}
+	if waited := time.Since(begin); waited > 500*time.Millisecond {
+		t.Errorf("tryAgain waited %v, want it capped near the 50ms deadline", waited)
+	}
+}
+
+// TestTryDurationAllowsAttemptWithinBudget verifies the complementary case:
+// with time remaining after the interval, another attempt is allowed.
+func TestTryDurationAllowsAttemptWithinBudget(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	t.Cleanup(cancel)
+
+	lb := LoadBalancing{
+		Retries:     10,
+		TryDuration: caddy.Duration(time.Second),
+		TryInterval: caddy.Duration(10 * time.Millisecond),
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", nil)
+	if !lb.tryAgain(caddyCtx, time.Now(), 1, DialError{}, req, zap.NewNop()) {
+		t.Errorf("tryAgain within budget = false, want true")
+	}
+}
+
+// TestBufferedBodyReplayedAfterUpstreamConsumedBody verifies that when an
+// upstream accepts the connection and fully consumes the request body before
+// dropping it (a transport error, not a dial error), buffering lets the
+// retry reach the backup with the body replayed exactly once, byte-for-byte
+// and with the same length, method, query and headers. This is the case the
+// non-buffered bodyNopCloserIfNotRead path cannot handle.
+func TestBufferedBodyReplayedAfterUpstreamConsumedBody(t *testing.T) {
+	const reqBody = `{"k":"v"}`
+
+	var gotMu sync.Mutex
+	var got struct {
+		count                           int
+		method, rawQuery, xTrace, ctype string
+		contentLength                   int64
+		body                            []byte
+	}
+	// Good backup: records the request and answers 201 + X-Trace + ok201.
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotMu.Lock()
+		got.count++
+		got.method = r.Method
+		got.rawQuery = r.URL.RawQuery
+		got.xTrace = r.Header.Get("X-Trace")
+		got.ctype = r.Header.Get("Content-Type")
+		got.contentLength = r.ContentLength
+		got.body = body
+		gotMu.Unlock()
+
+		w.Header().Set("X-Trace", "t-7")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("ok201"))
+	}))
+	t.Cleanup(goodServer.Close)
+
+	// First node consumes the body then disconnects before any response.
+	badServer := bodyConsumingUpstream(t)
+	t.Cleanup(badServer.Close)
+
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: badServer.Listener.Addr().String()},
+	}
+	// A connection established and then dropped is a transport error, not a
+	// dial error, so retrying a POST requires an explicit retry_match, just
+	// like the Caddyfile lb_retry_match used in the integration config.
+	retryMatch := caddyhttp.MatcherSets{
+		caddyhttp.MatcherSet{
+			newExpressionMatcher(t, "{http.reverse_proxy.is_transport_error} == true"),
+		},
+	}
+	h := minimalHandlerWithRetryMatch(1, retryMatch, upstreams...)
+	// RequestBuffers is what Provision sets automatically (-1 = unlimited)
+	// whenever a retry budget is configured; see LoadBalancing.retryEnabled.
+	h.RequestBuffers = -1
+
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/retry-body?a=1&b=2", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Trace", "t-7")
+	req = prepareTestRequest(req)
+
+	rec := httptest.NewRecorder()
+	err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(noopNext))
+	if err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", rec.Code)
+	}
+	if rec.Header().Get("X-Trace") != "t-7" {
+		t.Errorf("X-Trace: got %q, want t-7", rec.Header().Get("X-Trace"))
+	}
+	if rec.Body.String() != "ok201" {
+		t.Errorf("body: got %q, want ok201", rec.Body.String())
+	}
+
+	gotMu.Lock()
+	defer gotMu.Unlock()
+	if got.count != 1 {
+		t.Fatalf("backup received %d requests, want exactly 1", got.count)
+	}
+	if got.method != http.MethodPost {
+		t.Errorf("backup method: got %q, want POST", got.method)
+	}
+	if got.rawQuery != "a=1&b=2" {
+		t.Errorf("backup query: got %q, want a=1&b=2", got.rawQuery)
+	}
+	if got.ctype != "application/json" {
+		t.Errorf("backup Content-Type: got %q, want application/json", got.ctype)
+	}
+	if got.xTrace != "t-7" {
+		t.Errorf("backup X-Trace: got %q, want t-7", got.xTrace)
+	}
+	if got.contentLength != int64(len(reqBody)) {
+		t.Errorf("backup Content-Length: got %d, want %d", got.contentLength, len(reqBody))
+	}
+	if string(got.body) != reqBody {
+		t.Errorf("backup body: got %q, want %q", got.body, reqBody)
+	}
+}
+
+// TestUnbufferedBodyNotReplayedAfterConsumed documents the boundary of the
+// non-buffered path: when an upstream consumes the request body before
+// failing and buffering is disabled, the body cannot be rewound and the
+// request fails (this is why Provision enables buffering with a retry
+// budget). A refused dial before any byte still retries, but a consumed
+// streaming body cannot.
+func TestUnbufferedBodyNotReplayedAfterConsumed(t *testing.T) {
+	var backupMu sync.Mutex
+	var backupBodies [][]byte
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		backupMu.Lock()
+		backupBodies = append(backupBodies, body)
+		backupMu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(goodServer.Close)
+	badServer := bodyConsumingUpstream(t)
+	t.Cleanup(badServer.Close)
+
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: badServer.Listener.Addr().String()},
+	}
+	// allow the transport-error retry for POST explicitly so the resulting
+	// failure is caused by the un-rewindable body, not the method policy
+	retryMatch := caddyhttp.MatcherSets{
+		caddyhttp.MatcherSet{
+			newExpressionMatcher(t, "{http.reverse_proxy.is_transport_error} == true"),
+		},
+	}
+	h := minimalHandlerWithRetryMatch(1, retryMatch, upstreams...)
+	// deliberately leave RequestBuffers == 0 (buffering disabled)
+
+	req := prepareTestRequest(httptest.NewRequest(http.MethodPost, "http://example.com/",
+		newCloseOnCloseReader("payload")))
+	rec := httptest.NewRecorder()
+	serveErr := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(noopNext))
+
+	gotStatus := rec.Code
+	if serveErr != nil {
+		if herr, ok := serveErr.(caddyhttp.HandlerError); ok {
+			gotStatus = herr.StatusCode
+		}
+	}
+	if gotStatus != http.StatusBadGateway {
+		t.Errorf("status: got %d, want 502 (consumed unbuffered body cannot replay)", gotStatus)
+	}
+	// any request that reached the backup must not carry the original,
+	// already-consumed body: there is nothing left to replay
+	backupMu.Lock()
+	defer backupMu.Unlock()
+	for i, b := range backupBodies {
+		if string(b) == "payload" {
+			t.Errorf("backup request %d received the original body %q without buffering", i, b)
+		}
 	}
 }
