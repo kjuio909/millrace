@@ -111,6 +111,24 @@ func (adminLoad) handleLoad(w http.ResponseWriter, r *http.Request) error {
 		body = result
 	}
 
+	// a config load replaces the whole configuration, so the submitted
+	// document must be a non-empty JSON object; anything else (an empty
+	// body, null, a scalar or an array) cannot be parsed into a config
+	// and must be rejected before it can disturb the running config
+	var cfgObj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &cfgObj); err != nil {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("decoding config: %v", err),
+		}
+	}
+	if cfgObj == nil {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("config must be a JSON object"),
+		}
+	}
+
 	forceReload := r.Header.Get("Cache-Control") == "must-revalidate"
 
 	err = caddy.Load(body, forceReload)
