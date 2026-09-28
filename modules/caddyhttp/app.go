@@ -38,6 +38,16 @@ func init() {
 	caddy.RegisterModule(App{})
 }
 
+// defaultExitGracePeriod caps how long a process that is exiting (for example
+// after receiving SIGTERM) waits for in-flight HTTP requests to finish when no
+// explicit grace_period is configured. It only applies to whole-process exits,
+// not in-process config reloads (which retain the eternal grace period). It
+// keeps shutdown finite so a blocked upstream cannot stall process termination
+// and block a restart on the same address. Listening sockets are released
+// immediately when shutdown begins; only already-accepted requests may linger
+// up to this long before their connections are closed.
+const defaultExitGracePeriod = 5 * time.Second
+
 // App is a robust, production-ready HTTP server.
 //
 // HTTPS is enabled by default if host matchers with qualifying names are used
@@ -443,12 +453,39 @@ func removeTLSALPN(srv *Server, target string) {
 
 // Start runs the app. It finishes automatic HTTPS if enabled,
 // including management of certificates.
-func (app *App) Start() error {
+func (app *App) Start() (startErr error) {
 	// get a logger compatible with http.Server
 	serverLogger, err := zap.NewStdLogAt(app.logger.Named("stdlib"), zap.DebugLevel)
 	if err != nil {
 		return fmt.Errorf("failed to set up server logger: %v", err)
 	}
+
+	// if startup fails partway through (for example, one server fails to bind
+	// after another server already started listening), roll back every socket
+	// this Start opened so that a failed instance keeps accepting nothing and
+	// releases its addresses for a subsequent start. Closing a shared listener
+	// only drops this config's reference; a still-running previous config keeps
+	// its own reference and the underlying socket.
+	defer func() {
+		if startErr == nil {
+			return
+		}
+		for _, srv := range app.Servers {
+			for _, ln := range srv.listeners {
+				_ = ln.Close()
+			}
+			srv.listeners = nil
+			for _, h3ln := range srv.quicListeners {
+				_ = h3ln.Close()
+				_ = h3ln.Close()
+			}
+			srv.quicListeners = nil
+			if srv.h3server != nil {
+				_ = srv.h3server.Close()
+				srv.h3server = nil
+			}
+		}
+	}()
 
 	for srvName, srv := range app.Servers {
 		srv.server = &http.Server{
@@ -684,13 +721,28 @@ func (app *App) Stop() error {
 	}
 
 	// enforce grace period if configured
-	if app.GracePeriod > 0 {
+	switch {
+	case app.GracePeriod > 0:
 		var cancel context.CancelFunc
 		timeout := time.Duration(app.GracePeriod)
 		ctx, cancel = context.WithTimeoutCause(ctx, timeout, fmt.Errorf("server graceful shutdown %ds timeout", int(timeout.Seconds())))
 		defer cancel()
 		app.logger.Info("servers shutting down; grace period initiated", zap.Duration("duration", timeout))
-	} else {
+	case caddy.Exiting():
+		// The whole process is going away and must terminate in a finite,
+		// predictable time so a caller can restart it on the same address.
+		// With no explicit grace period we still cap the wait for in-flight
+		// requests: listeners stop accepting immediately, and any request
+		// that has not completed by then (e.g. one that is blocked on an
+		// upstream indefinitely) is closed rather than stalling shutdown
+		// forever. Configure a positive grace_period to wait longer.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeoutCause(ctx, defaultExitGracePeriod,
+			fmt.Errorf("server graceful shutdown %ds timeout", int(defaultExitGracePeriod.Seconds())))
+		defer cancel()
+		app.logger.Info("servers shutting down; grace period initiated for process exit",
+			zap.Duration("duration", defaultExitGracePeriod))
+	default:
 		app.logger.Info("servers shutting down with eternal grace period")
 	}
 

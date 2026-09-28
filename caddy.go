@@ -773,13 +773,34 @@ func exitProcess(ctx context.Context, logger *zap.Logger) {
 	}
 	logger.Warn("exiting; byeee!! 👋")
 
-	exitCode := ExitCodeSuccess
+	var exitCode atomic.Int32 // ExitCode* ; written by admin-shutdown goroutines and this flow
 	lastContext := ActiveContext()
+
+	// begin shutting down the admin endpoint(s) now: http.Server.Shutdown
+	// closes the listening socket immediately (so a replacement process can
+	// rebind the admin address without waiting) while it drains in-flight API
+	// requests in the background. This must run concurrently (rather than
+	// after the apps stop) because exitProcess may itself be running inside an
+	// admin API handler that needs to return before that drain can complete.
+	var adminShutdown sync.WaitGroup
+	for _, adminServer := range []*http.Server{remoteAdminServer, localAdminServer} {
+		if adminServer == nil {
+			continue
+		}
+		adminShutdown.Add(1)
+		go func(srv *http.Server) {
+			defer adminShutdown.Done()
+			if err := stopAdminServer(srv); err != nil {
+				logger.Error("failed to stop admin server gracefully", zap.Error(err))
+				exitCode.Store(ExitCodeFailedQuit)
+			}
+		}(adminServer)
+	}
 
 	// stop all apps
 	if err := Stop(); err != nil {
 		logger.Error("failed to stop apps", zap.Error(err))
-		exitCode = ExitCodeFailedQuit
+		exitCode.Store(ExitCodeFailedQuit)
 	}
 
 	// clean up certmagic locks
@@ -792,7 +813,7 @@ func exitProcess(ctx context.Context, logger *zap.Logger) {
 			logger.Error("cleaning up PID file:",
 				zap.String("pidfile", pidfile),
 				zap.Error(err))
-			exitCode = ExitCodeFailedQuit
+			exitCode.Store(ExitCodeFailedQuit)
 		}
 	}
 
@@ -806,35 +827,22 @@ func exitProcess(ctx context.Context, logger *zap.Logger) {
 	}
 	exitFuncsMu.Unlock()
 
-	// shut down admin endpoint(s) in goroutines so that
-	// if this function was called from an admin handler,
-	// it has a chance to return gracefully
-	// use goroutine so that we can finish responding to API request
+	// Finish in a goroutine so that if exitProcess was invoked from an admin
+	// API handler (e.g. POST /stop), that handler can return and let the admin
+	// drain complete before the process exits.
 	go func() {
-		defer func() {
-			logger = logger.With(zap.Int("exit_code", exitCode))
-			if exitCode == ExitCodeSuccess {
-				logger.Info("shutdown complete")
-			} else {
-				logger.Error("unclean shutdown")
-			}
-			os.Exit(exitCode)
-		}()
+		// wait for the admin endpoint(s) to finish draining (their listen
+		// addresses were already closed by Shutdown when it began)
+		adminShutdown.Wait()
 
-		if remoteAdminServer != nil {
-			err := stopAdminServer(remoteAdminServer)
-			if err != nil {
-				exitCode = ExitCodeFailedQuit
-				logger.Error("failed to stop remote admin server gracefully", zap.Error(err))
-			}
+		code := int(exitCode.Load())
+		logger = logger.With(zap.Int("exit_code", code))
+		if code == ExitCodeSuccess {
+			logger.Info("shutdown complete")
+		} else {
+			logger.Error("unclean shutdown")
 		}
-		if localAdminServer != nil {
-			err := stopAdminServer(localAdminServer)
-			if err != nil {
-				exitCode = ExitCodeFailedQuit
-				logger.Error("failed to stop local admin server gracefully", zap.Error(err))
-			}
-		}
+		os.Exit(code)
 	}()
 }
 

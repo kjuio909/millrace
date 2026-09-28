@@ -32,9 +32,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
-
-	"go.uber.org/zap"
-	"golang.org/x/sys/unix"
 )
 
 // reuseUnixSocket copies and reuses the unix domain socket (UDS) if we already
@@ -91,11 +88,15 @@ func reuseUnixSocket(network, addr string) (any, error) {
 }
 
 // listenReusable creates a new listener for the given network and address, and adds it to listenerPool.
+//
+// TCP and UDP sockets are shared across configs within this process via the
+// listenerPool (one real socket per address, wrapped in a fake-closing listener)
+// so that graceful config reloads can overlap. We deliberately do NOT set
+// SO_REUSEPORT: allowing another *process* to bind the same address would
+// silently split traffic between two instances and mask "address already in
+// use" failures, which must instead surface as a startup error. Unix-domain and
+// fd-passed sockets keep their own dup/reuse accounting.
 func listenReusable(ctx context.Context, lnKey string, network, address string, config net.ListenConfig) (any, error) {
-	// even though SO_REUSEPORT lets us bind the socket multiple times,
-	// we still put it in the listenerPool so we can count how many
-	// configs are using this socket; necessary to ensure we can know
-	// whether to enforce shutdown delays, for example (see #5393).
 	var (
 		ln         io.Closer
 		err        error
@@ -129,20 +130,40 @@ func listenReusable(ctx context.Context, lnKey string, network, address string, 
 		if socketFile == nil {
 			return nil, fmt.Errorf("invalid socket file descriptor: %d", socketFd)
 		}
-	} else {
-		// wrap any Control function set by the user so we can also add our reusePort control without clobbering theirs
-		oldControl := config.Control
-		config.Control = func(network, address string, c syscall.RawConn) error {
-			if oldControl != nil {
-				if err := oldControl(network, address, c); err != nil {
-					return err
-				}
-			}
-			return reusePort(network, address, c)
-		}
 	}
 
 	datagram := slices.Contains([]string{"udp", "udp4", "udp6", "unixgram", "fdgram"}, network)
+
+	// TCP/UDP sockets are shared across configs in this process via a single
+	// real socket held in the listenerPool; each user gets a fake-closing handle.
+	if !fd && !IsUnixNetwork(network) {
+		if datagram {
+			sharedPc, _, err := listenerPool.LoadOrNew(lnKey, func() (Destructor, error) {
+				pc, err := config.ListenPacket(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				return &sharedPacketConn{PacketConn: pc, key: lnKey}, nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			return &fakeClosePacketConn{sharedPacketConn: sharedPc.(*sharedPacketConn)}, nil
+		}
+
+		sharedLn, _, err := listenerPool.LoadOrNew(lnKey, func() (Destructor, error) {
+			l, err := config.Listen(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			return &sharedListener{Listener: l, key: lnKey}, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &fakeCloseListener{sharedListener: sharedLn.(*sharedListener), keepAliveConfig: config.KeepAliveConfig}, nil
+	}
+
 	if datagram {
 		if fd {
 			ln, err = net.FilePacketConn(socketFile)
@@ -156,18 +177,23 @@ func listenReusable(ctx context.Context, lnKey string, network, address string, 
 			ln, err = config.Listen(ctx, network, address)
 		}
 	}
-
-	if err == nil {
-		listenerPool.LoadOrStore(lnKey, nil)
+	if err != nil {
+		return nil, err
 	}
 
+	// even though SO_REUSEPORT isn't used for these sockets, we still count
+	// them in the listenerPool so ListenerUsage() can account for them
+	// (necessary to decide on shutdown delays, for example; see #5393).
+	listenerPool.LoadOrStore(lnKey, nil)
+
 	if datagram {
+		// unixgram sockets: track them like stream unix sockets so they can be
+		// dup'd and reused during config reloads
 		if !fd {
-			// TODO: Not 100% sure this is necessary, but we do this for net.UnixListener, so...
-			if unix, ok := ln.(*net.UnixConn); ok {
+			if u, ok := ln.(*net.UnixConn); ok {
 				cnt := new(atomic.Int32)
 				cnt.Store(1)
-				ln = &unixConn{unix, lnKey, cnt}
+				ln = &unixConn{u, lnKey, cnt}
 				unixSockets[lnKey] = ln.(*unixConn)
 			}
 		}
@@ -177,14 +203,14 @@ func listenReusable(ctx context.Context, lnKey string, network, address string, 
 			ln = deletePacketConn{specificLn, lnKey}
 		}
 	} else {
+		// if new listener is a unix socket, make sure we can reuse it later
+		// (we do our own "unlink on close" -- not required, but more tidy)
 		if !fd {
-			// if new listener is a unix socket, make sure we can reuse it later
-			// (we do our own "unlink on close" -- not required, but more tidy)
-			if unix, ok := ln.(*net.UnixListener); ok {
-				unix.SetUnlinkOnClose(false)
+			if u, ok := ln.(*net.UnixListener); ok {
+				u.SetUnlinkOnClose(false)
 				cnt := new(atomic.Int32)
 				cnt.Store(1)
-				ln = &unixListener{unix, lnKey, cnt}
+				ln = &unixListener{u, lnKey, cnt}
 				unixSockets[lnKey] = ln.(*unixListener)
 			}
 		}
@@ -196,23 +222,7 @@ func listenReusable(ctx context.Context, lnKey string, network, address string, 
 	}
 
 	// other types, I guess we just return them directly
-	return ln, err
-}
-
-// reusePort sets SO_REUSEPORT. Ineffective for unix sockets.
-func reusePort(network, address string, conn syscall.RawConn) error {
-	if IsUnixNetwork(network) {
-		return nil
-	}
-	return conn.Control(func(descriptor uintptr) {
-		if err := unix.SetsockoptInt(int(descriptor), unix.SOL_SOCKET, unixSOREUSEPORT, 1); err != nil {
-			Log().Error("setting SO_REUSEPORT",
-				zap.String("network", network),
-				zap.String("address", address),
-				zap.Uintptr("descriptor", descriptor),
-				zap.Error(err))
-		}
-	})
+	return ln, nil
 }
 
 type unixListener struct {
@@ -277,7 +287,7 @@ var unixSockets = make(map[string]interface {
 	File() (*os.File, error)
 })
 
-// socketFiles is a fd -> *os.File map used to make a FileListener/FilePacketConn from a socket file descriptor.
+// socketFiles is a fd -> *os.File map used to make a FileListener/FilePacketConn from a file descriptor.
 var socketFiles = map[uintptr]*os.File{}
 
 // socketFilesMu synchronizes socketFiles insertions
