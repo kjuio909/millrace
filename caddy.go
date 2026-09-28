@@ -359,46 +359,71 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 		return fmt.Errorf("recursive config loading detected: pulled configs cannot pull other configs without positive load_delay")
 	}
 
-	// run the new config and start all its apps
-	ctx, err := run(newCfg, true)
-	if err != nil {
+	// run the new config and start all its apps; a successful run has
+	// provisioned and started the apps, atomically persisted the config
+	// (when allowed), published the admin endpoint and replaced the
+	// previous context - so a returned error means none of that happened
+	// and the caller can keep (and restore its raw state to) the previous
+	// configuration, which is still running
+	if _, err := run(newCfg, true, allowPersist, cfgJSON); err != nil {
 		return err
 	}
 
-	// swap old context (including its config) with the new one
-	currentCtxMu.Lock()
-	oldCtx := currentCtx
-	currentCtx = ctx
-	currentCtxMu.Unlock()
+	return nil
+}
 
-	// Stop, Cleanup each old app
-	unsyncedStop(oldCtx)
+// configPersists reports whether cfg opts into keeping the active config on
+// disk. Persistence is on by default and is only disabled by an explicit
+// admin.config.persist set to false.
+func configPersists(cfg *Config) bool {
+	return cfg == nil ||
+		cfg.Admin == nil ||
+		cfg.Admin.Config == nil ||
+		cfg.Admin.Config.Persist == nil ||
+		*cfg.Admin.Config.Persist
+}
 
-	// autosave a non-nil config, if not disabled
-	if allowPersist &&
-		newCfg != nil &&
-		(newCfg.Admin == nil ||
-			newCfg.Admin.Config == nil ||
-			newCfg.Admin.Config.Persist == nil ||
-			*newCfg.Admin.Config.Persist) {
-		dir := filepath.Dir(ConfigAutosavePath)
-		err := os.MkdirAll(dir, 0o700)
-		if err != nil {
-			Log().Error("unable to create folder for config autosave",
-				zap.String("dir", dir),
-				zap.Error(err))
-		} else {
-			err := os.WriteFile(ConfigAutosavePath, cfgJSON, 0o600)
-			if err == nil {
-				Log().Info("autosaved config (load with --resume flag)", zap.String("file", ConfigAutosavePath))
-			} else {
-				Log().Error("unable to autosave config",
-					zap.String("file", ConfigAutosavePath),
-					zap.Error(err))
-			}
-		}
+// persistActiveConfig atomically writes cfgJSON to the autosave path so a
+// later process started with --resume loads exactly the running version. The
+// write is durable (the file and its directory are synced) and atomic (a
+// temporary file in the same directory is synced and then renamed into
+// place), so a crash, a full disk or any other failed write can never leave
+// a truncated or half-written document for a future start to resume.
+func persistActiveConfig(cfgJSON []byte) error {
+	dir := filepath.Dir(ConfigAutosavePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("creating autosave directory %s: %v", dir, err)
 	}
 
+	tmp, err := os.CreateTemp(dir, ".autosave.json.tmp-*")
+	if err != nil {
+		return fmt.Errorf("creating temporary autosave file: %v", err)
+	}
+	tmpName := tmp.Name()
+	// the temp file is only meant to exist up to the successful rename;
+	// Remove is a no-op once it has been renamed
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if _, err := tmp.Write(cfgJSON); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("writing autosave file: %v", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("flushing autosave file to disk: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing autosave file: %v", err)
+	}
+	if err := os.Rename(tmpName, ConfigAutosavePath); err != nil {
+		return fmt.Errorf("replacing autosave file: %v", err)
+	}
+	// sync the directory entry so the rename is durable across a crash;
+	// best-effort on platforms where a directory cannot be opened/synced
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
 	return nil
 }
 
@@ -416,7 +441,15 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 // This is a low-level function; most callers
 // will want to use Run instead, which also
 // updates the config's raw state.
-func run(newCfg *Config, start bool) (Context, error) {
+//
+// When start is true and allowPersist is true, the active config is
+// atomically persisted to disk (unless it sets admin.config.persist to
+// false) as part of the same commit that publishes it. Persistence is a
+// prerequisite of the commit, so a returned error leaves the previous
+// configuration - and its persisted document - completely untouched.
+// persistJSON is the exact document to persist (usually the raw,
+// meta-field-bearing input); it is only consulted when the config starts.
+func run(newCfg *Config, start, allowPersist bool, persistJSON []byte) (Context, error) {
 	ctx, adminChange, err := provisionContext(newCfg, start)
 	if err != nil {
 		globalMetrics.configSuccess.Set(0)
@@ -484,11 +517,41 @@ func run(newCfg *Config, start bool) (Context, error) {
 		return ctx, err
 	}
 
-	// everything (apps, identity, remote admin) is up: only now publish
-	// the prepared local admin endpoint, so a configuration that failed
-	// to start never takes the management listener away from the last
-	// good configuration
+	// everything runtime (apps, identity, remote admin) is up, but the new
+	// version is not yet published: the previous one is still serving and
+	// its admin endpoint and persisted document are still in place. Persist
+	// the new document before that publication so success on disk, on the
+	// listener and on the management endpoint share a single boundary. A
+	// failed persistence is treated like any other start failure: the
+	// deferred cleanup tears the prepared version back down while the
+	// previous configuration - including its persisted document - keeps
+	// serving unchanged. An empty/nil document (e.g. `caddy run` with no
+	// config file at all) is not a configuration worth resuming, so it is
+	// never written.
+	if allowPersist && len(persistJSON) > 0 && configPersists(ctx.cfg) {
+		if persistErr := persistActiveConfig(persistJSON); persistErr != nil {
+			// assign the outer err (not a shadowed one) so the deferred
+			// rollback tears the prepared version down; returning here runs
+			// it before we give the error back
+			err = fmt.Errorf("persisting new config: %v", persistErr)
+			return ctx, err
+		}
+		Log().Info("autosaved config (load with --resume flag)", zap.String("file", ConfigAutosavePath))
+	}
+
+	// only now publish the prepared local admin endpoint, so a
+	// configuration that failed to start or to persist never takes the
+	// management listener away from the last good configuration
 	adminChange.commit()
+
+	// the new version is fully published and durable; make its context the
+	// current one and stop/clean up the previous version
+	currentCtxMu.Lock()
+	oldCtx := currentCtx
+	currentCtx = ctx
+	currentCtxMu.Unlock()
+
+	unsyncedStop(oldCtx)
 
 	return ctx, nil
 }
@@ -768,7 +831,7 @@ func unsyncedStop(ctx Context) {
 // Validate loads, provisions, and validates
 // cfg, but does not start running it.
 func Validate(cfg *Config) error {
-	_, err := run(cfg, false)
+	_, err := run(cfg, false, false, nil)
 	if err == nil {
 		cfg.cancelFunc(fmt.Errorf("validation complete")) // call Cleanup on all modules
 	}
