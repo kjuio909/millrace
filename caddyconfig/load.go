@@ -113,6 +113,25 @@ func (adminLoad) handleLoad(w http.ResponseWriter, r *http.Request) error {
 
 	forceReload := r.Header.Get("Cache-Control") == "must-revalidate"
 
+	// A load carries a complete replacement configuration; never allow an
+	// empty or null body to be interpreted as one, since that would unload
+	// the currently-running config (a brief empty/half-initialized state).
+	// Malformed payloads are left to caddy.Load so they surface through the
+	// same decoding errors and rollback as any other invalid config.
+	trimmedBody := bytes.TrimSpace(body)
+	if len(trimmedBody) == 0 {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("loading config: request body is empty; expected a complete JSON configuration"),
+		}
+	}
+	if bytes.Equal(trimmedBody, []byte("null")) {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("loading config: request body must be a JSON object, got null"),
+		}
+	}
+
 	err = caddy.Load(body, forceReload)
 	if err != nil {
 		return caddy.APIError{
