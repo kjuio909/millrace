@@ -451,6 +451,7 @@ func (app *App) Start() error {
 	}
 
 	for srvName, srv := range app.Servers {
+		srv.drain = newDrainController()
 		srv.server = &http.Server{
 			ReadTimeout:       time.Duration(srv.ReadTimeout),
 			ReadHeaderTimeout: time.Duration(srv.ReadHeaderTimeout),
@@ -471,6 +472,7 @@ func (app *App) Start() error {
 				return ctx
 			},
 		}
+		srv.server.RegisterOnShutdown(srv.drain.onServerShutdown)
 
 		// disable HTTP/2, which we enabled by default during provisioning
 		if !srv.protocol("h2") {
@@ -596,8 +598,14 @@ func (app *App) Start() error {
 
 					srv.listeners = append(srv.listeners, ln)
 
-					//nolint:errcheck
-					go srv.server.Serve(ln)
+					// track the Serve loop so a config-switch drain can wait
+					// for accepting to stop deterministically
+					serveFinished := srv.drain.trackServe()
+					go func() {
+						defer serveFinished()
+						//nolint:errcheck
+						srv.server.Serve(ln)
+					}()
 				}
 
 				if h2ok && !useTLS {
@@ -694,38 +702,47 @@ func (app *App) Stop() error {
 		app.logger.Info("servers shutting down with eternal grace period")
 	}
 
-	// goroutines aren't guaranteed to be scheduled right away,
-	// so we'll use one WaitGroup to wait for all the goroutines
-	// to start their server shutdowns, and another to wait for
-	// them to finish; we'll always block for them to start so
-	// that when we return the caller can be confident* that the
-	// old servers are no longer accepting new connections
-	// (* the scheduler might still pause them right before
-	// calling Shutdown(), but it's unlikely)
-	var startedShutdown, finishedShutdown sync.WaitGroup
+	// fenceWG is released by each HTTP/1/2 server as soon as it provably stops
+	// accepting new connections and requests; Stop always waits for it so the
+	// switch boundary is deterministic. finishedShutdown is released only once
+	// a server has fully drained its in-flight responses (up to the grace
+	// period); it is awaited solely when the process is exiting.
+	var fenceWG, finishedShutdown sync.WaitGroup
 
-	// these will run in goroutines
 	stopServer := func(server *Server) {
 		defer finishedShutdown.Done()
-		startedShutdown.Done()
 
 		// possible if server failed to Start
-		if server.server == nil {
+		if server.server == nil || server.drain == nil {
+			fenceWG.Done()
 			return
 		}
 
-		if err := server.server.Shutdown(ctx); err != nil {
-			if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.DeadlineExceeded) {
-				err = cause
-			}
-			app.logger.Error("server shutdown",
-				zap.Error(err),
-				zap.Strings("addresses", server.Listen))
+		// beginDrain runs http.Server.Shutdown in the background with a
+		// context owned by the drain itself (not Stop, which returns once the
+		// fence below is reached): it closes the listeners, disables keep-alive
+		// admission, broadcasts HTTP/2 GOAWAY and then serves in-flight
+		// responses until they finish or the grace period expires.
+		done := server.drain.beginDrain(server.server, time.Duration(app.GracePeriod),
+			app.logger.With(zap.Strings("addresses", server.Listen)))
+
+		// Wait until this server provably stopped accepting new connections
+		// and requests before reporting the fence for this server. This is the
+		// deterministic switch boundary: once fenceWG is satisfied a reused
+		// keep-alive connection can only be refused/closed by the old server
+		// and any new connection or multiplexed stream reaches the new server -
+		// while responses already in flight keep draining in the background.
+		server.drain.waitFence(app.logger.With(zap.Strings("addresses", server.Listen)))
+		fenceWG.Done()
+
+		// only a process exit waits for the in-flight responses themselves;
+		// otherwise the drain completes asynchronously after Stop returns
+		if caddy.Exiting() {
+			<-done
 		}
 	}
 	stopH3Server := func(server *Server) {
 		defer finishedShutdown.Done()
-		startedShutdown.Done()
 
 		if server.h3server == nil {
 			return
@@ -759,29 +776,31 @@ func (app *App) Stop() error {
 		}
 	}
 
+	// Start every drain. HTTP/1/2 servers report the deterministic admission
+	// fence via fenceWG; their full in-flight drain and all of HTTP/3 run in
+	// the background and are tracked by finishedShutdown.
 	for _, server := range app.Servers {
-		startedShutdown.Add(2)
+		fenceWG.Add(1)
 		finishedShutdown.Add(2)
 		go stopServer(server)
 		go stopH3Server(server)
 	}
 
-	// block until all the goroutines have been run by the scheduler;
-	// this means that they have likely called Shutdown() by now
-	startedShutdown.Wait()
+	// Deterministic switch boundary: block until every old HTTP/1/2 server has
+	// stopped accepting new connections and requests, independent of scheduler
+	// timing. In-flight responses keep draining in the background.
+	fenceWG.Wait()
 
-	// if the process is exiting, we need to block here and wait
-	// for the grace periods to complete, otherwise the process will
-	// terminate before the servers are finished shutting down; but
-	// we don't really need to wait for the grace period to finish
-	// if the process isn't exiting (but note that frequent config
-	// reloads with long grace periods for a sustained length of time
-	// may deplete resources)
+	// additionally wait for every server (including the in-flight HTTP/1/2
+	// drain and HTTP/3) only when the process is exiting, so the process does
+	// not terminate while responses are still being served
 	if caddy.Exiting() {
 		finishedShutdown.Wait()
 	}
 
-	// run stop callbacks now that the server shutdowns are complete
+	// run stop callbacks; when exiting the servers are fully shut down by now,
+	// otherwise they drain in the background. Either way the old handler
+	// instances are the only owners of these callbacks.
 	for name, s := range app.Servers {
 		for _, stopHook := range s.onStopFuncs {
 			if err := stopHook(ctx); err != nil {

@@ -289,6 +289,10 @@ type Server struct {
 	h3server  *http3.Server
 	addresses []caddy.NetworkAddress
 
+	// drain makes the point at which this server stops accepting new
+	// connections and requests deterministic across a config switch
+	drain *drainController
+
 	trustedProxies IPRangeSource
 
 	shutdownAt atomic.Pointer[time.Time]
