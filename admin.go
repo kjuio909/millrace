@@ -38,6 +38,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -364,36 +365,52 @@ func (admin AdminConfig) allowedOrigins(addr NetworkAddress) []*url.URL {
 	return allowed
 }
 
-// replaceLocalAdminServer replaces the running local admin server
-// according to the relevant configuration in cfg. If no configuration
-// for the admin endpoint exists in cfg, a default one is used, so
-// that there is always an admin server (unless it is explicitly
+// adminHandlerSwitch holds an adminHandler behind an atomic pointer so a
+// running admin server can keep its listener across configuration loads
+// that do not change its address: only the handler is swapped at commit.
+// This means a rolled-back load never has to close the listener that is
+// currently serving the very request that submitted the bad config.
+type adminHandlerSwitch struct {
+	value atomic.Pointer[adminHandler]
+}
+
+func (s *adminHandlerSwitch) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.value.Load().ServeHTTP(w, r)
+}
+
+// localAdminChange is a prepared replacement of the local admin endpoint.
+// It has no effect until commit is called; if the new configuration fails
+// before it is committed, rollback leaves the previously running admin
+// endpoint - its listener, its server and its handler - untouched.
+type localAdminChange struct {
+	// disable is set when the new configuration turns the endpoint off
+	disable bool
+
+	// switcher and handler are set when the address is unchanged: the
+	// running server keeps serving and commit atomically swaps in the
+	// new handler; rollback has nothing to undo because the new handler
+	// was never published
+	switcher *adminHandlerSwitch
+	handler  adminHandler
+
+	// newServer is set at initial startup or when the address changes:
+	// commit publishes the server and stops the previous one, while
+	// rollback closes this prepared server without touching the old one
+	newServer *http.Server
+	addr      NetworkAddress
+
+	// copied from the prepared handler for the startup log
+	enforceOrigin bool
+}
+
+// prepareLocalAdminServer provisions the local admin endpoint described by
+// cfg without disturbing the endpoint that is currently running. If no
+// configuration for the admin endpoint exists in cfg, a default one is
+// used, so there is always an admin server (unless it is explicitly
 // configured to be disabled).
 // Critically note that some elements and functionality of the context
 // may not be ready, e.g. storage. Tread carefully.
-func replaceLocalAdminServer(cfg *Config, ctx Context) error {
-	// always* be sure to close down the old admin endpoint
-	// as gracefully as possible, even if the new one is
-	// disabled -- careful to use reference to the current
-	// (old) admin endpoint since it will be different
-	// when the function returns
-	// (* except if the new one fails to start)
-	oldAdminServer := localAdminServer
-	var err error
-	defer func() {
-		// do the shutdown asynchronously so that any
-		// current API request gets a response; this
-		// goroutine may last a few seconds
-		if oldAdminServer != nil && err == nil {
-			go func(oldAdminServer *http.Server) {
-				err := stopAdminServer(oldAdminServer)
-				if err != nil {
-					Log().Named("admin").Error("stopping current admin endpoint", zap.Error(err))
-				}
-			}(oldAdminServer)
-		}
-	}()
-
+func prepareLocalAdminServer(cfg *Config, ctx Context) (*localAdminChange, error) {
 	// set a default if admin wasn't otherwise configured
 	if cfg.Admin == nil {
 		cfg.Admin = &AdminConfig{
@@ -401,60 +418,146 @@ func replaceLocalAdminServer(cfg *Config, ctx Context) error {
 		}
 	}
 
-	// if new admin endpoint is to be disabled, we're done
+	// if new admin endpoint is to be disabled, nothing to prepare;
+	// commit stops the running endpoint (rollback therefore has
+	// nothing to undo)
 	if cfg.Admin.Disabled {
-		Log().Named("admin").Warn("admin endpoint disabled")
-		return nil
+		Log().Named("admin").Warn("admin endpoint will be disabled")
+		return &localAdminChange{disable: true}, nil
 	}
 
 	// extract a singular listener address
 	addr, err := parseAdminListenAddr(cfg.Admin.Listen, DefaultAdminListen)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	handler, err := cfg.Admin.newAdminHandler(addr, false, ctx)
 	if err != nil {
-		return err
+		return nil, err
+	}
+
+	change := &localAdminChange{
+		handler:       handler,
+		addr:          addr,
+		enforceOrigin: cfg.Admin.EnforceOrigin,
+	}
+
+	// when the address does not change, the running server keeps its
+	// listener and only its (atomically swappable) handler needs to be
+	// replaced at commit; no socket is (re)bound, so a rolled-back load
+	// cannot interrupt or answer the connection that submitted it
+	serverMu.Lock()
+	current := localAdminServer
+	serverMu.Unlock()
+	if current != nil && current.Addr == addr.String() {
+		switcher, ok := current.Handler.(*adminHandlerSwitch)
+		if !ok {
+			return nil, fmt.Errorf("internal: unexpected admin handler type %T", current.Handler)
+		}
+		change.switcher = switcher
+		return change, nil
 	}
 
 	ln, err := addr.Listen(context.TODO(), 0, net.ListenConfig{})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	serverMu.Lock()
-	localAdminServer = &http.Server{
+	switcher := new(adminHandlerSwitch)
+	switcher.value.Store(&handler)
+
+	server := &http.Server{
 		Addr:              addr.String(), // for logging purposes only
-		Handler:           handler,
+		Handler:           switcher,
 		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1024 * 64,
 	}
-	serverMu.Unlock()
+	change.newServer = server
 
 	adminLogger := Log().Named("admin")
 	go func() {
-		serverMu.Lock()
-		server := localAdminServer
-		serverMu.Unlock()
 		if err := server.Serve(ln.(net.Listener)); !errors.Is(err, http.ErrServerClosed) {
 			adminLogger.Error("admin server shutdown for unknown reason", zap.Error(err))
 		}
 	}()
 
-	adminLogger.Info("admin endpoint started",
-		zap.String("address", addr.String()),
-		zap.Bool("enforce_origin", cfg.Admin.EnforceOrigin),
-		zap.Array("origins", loggableURLArray(handler.allowedOrigins)))
+	return change, nil
+}
 
-	if !handler.enforceHost {
-		adminLogger.Warn("admin endpoint on open interface; host checking disabled",
-			zap.String("address", addr.String()))
+// commit publishes the prepared admin endpoint: it either swaps the handler
+// of the still-running server in place, starts serving a newly prepared
+// server and stops the previous one, or stops the previous one when the
+// endpoint is disabled.
+func (change *localAdminChange) commit() {
+	if change == nil {
+		return
 	}
 
-	return nil
+	adminLogger := Log().Named("admin")
+
+	// same address: atomically publish the new handler on the
+	// existing server, without touching its listener
+	if change.switcher != nil {
+		change.switcher.value.Store(&change.handler)
+		adminLogger.Info("admin endpoint updated",
+			zap.String("address", change.addr.String()))
+		return
+	}
+
+	serverMu.Lock()
+	oldAdminServer := localAdminServer
+	if change.disable {
+		localAdminServer = nil
+	} else {
+		localAdminServer = change.newServer
+	}
+	serverMu.Unlock()
+
+	// shut down the old endpoint asynchronously so any current API
+	// request (potentially the one that triggered this commit) gets
+	// its response; this goroutine may last a few seconds
+	if oldAdminServer != nil {
+		go func(oldAdminServer *http.Server) {
+			if err := stopAdminServer(oldAdminServer); err != nil {
+				Log().Named("admin").Error("stopping current admin endpoint", zap.Error(err))
+			}
+		}(oldAdminServer)
+	}
+
+	if change.disable {
+		adminLogger.Warn("admin endpoint disabled")
+		return
+	}
+
+	adminLogger.Info("admin endpoint started",
+		zap.String("address", change.addr.String()),
+		zap.Bool("enforce_origin", change.enforceOrigin),
+		zap.Array("origins", loggableURLArray(change.handler.allowedOrigins)))
+
+	if !change.handler.enforceHost {
+		adminLogger.Warn("admin endpoint on open interface; host checking disabled",
+			zap.String("address", change.addr.String()))
+	}
+}
+
+// rollback abandons a prepared admin endpoint after the new configuration
+// failed. A same-address preparation never published its handler and a
+// disabling preparation never stopped the old endpoint, so they need no
+// cleanup; a freshly started server (different address or initial startup)
+// is drained and closed asynchronously while the previous endpoint keeps
+// serving.
+func (change *localAdminChange) rollback() {
+	if change == nil || change.newServer == nil {
+		return
+	}
+	go func(server *http.Server) {
+		if err := stopAdminServer(server); err != nil {
+			Log().Named("admin").Error("stopping prepared admin endpoint after failed config load", zap.Error(err))
+		}
+	}(change.newServer)
 }
 
 // manageIdentity sets up automated identity management for this server.

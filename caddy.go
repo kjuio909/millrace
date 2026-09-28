@@ -417,9 +417,12 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 // will want to use Run instead, which also
 // updates the config's raw state.
 func run(newCfg *Config, start bool) (Context, error) {
-	ctx, err := provisionContext(newCfg, start)
+	ctx, adminChange, err := provisionContext(newCfg, start)
 	if err != nil {
 		globalMetrics.configSuccess.Set(0)
+		// keep the previously running admin endpoint serving if a
+		// replacement was prepared but never committed
+		adminChange.rollback()
 		return ctx, err
 	}
 
@@ -433,6 +436,10 @@ func run(newCfg *Config, start bool) (Context, error) {
 		if err != nil {
 			globalMetrics.configSuccess.Set(0)
 			ctx.cfg.cancelFunc(fmt.Errorf("configuration start error: %w", err))
+
+			// abandon the prepared admin endpoint without disturbing
+			// the one that is still serving the last good configuration
+			adminChange.rollback()
 
 			if currentCtx.cfg != nil {
 				certmagic.Default.Storage = currentCtx.cfg.storage
@@ -473,15 +480,27 @@ func run(newCfg *Config, start bool) (Context, error) {
 	// now that the user's config is running, finish setting up anything else,
 	// such as remote admin endpoint, config loader, etc.
 	err = finishSettingUp(ctx, ctx.cfg)
-	return ctx, err
+	if err != nil {
+		return ctx, err
+	}
+
+	// everything (apps, identity, remote admin) is up: only now publish
+	// the prepared local admin endpoint, so a configuration that failed
+	// to start never takes the management listener away from the last
+	// good configuration
+	adminChange.commit()
+
+	return ctx, nil
 }
 
 // provisionContext creates a new context from the given configuration and provisions
 // storage and apps.
 // If `newCfg` is nil a new empty configuration will be created.
-// If `replaceAdminServer` is true any currently active admin server will be replaced
-// with a new admin server based on the provided configuration.
-func provisionContext(newCfg *Config, replaceAdminServer bool) (Context, error) {
+// If `replaceAdminServer` is true the local admin server described by the
+// configuration is provisioned and returned as a pending change: it does not
+// affect the running admin endpoint until the caller commits it (and must be
+// rolled back if the new configuration fails).
+func provisionContext(newCfg *Config, replaceAdminServer bool) (Context, *localAdminChange, error) {
 	// because we will need to roll back any state
 	// modifications if this function errors, we
 	// keep a single error value and scope all
@@ -490,6 +509,7 @@ func provisionContext(newCfg *Config, replaceAdminServer bool) (Context, error) 
 	// overridden or missed when it should have
 	// been set by a short assignment
 	var err error
+	var adminChange *localAdminChange
 
 	if newCfg == nil {
 		newCfg = new(Config)
@@ -526,7 +546,7 @@ func provisionContext(newCfg *Config, replaceAdminServer bool) (Context, error) 
 	}
 	err = newCfg.Logging.openLogs(ctx)
 	if err != nil {
-		return ctx, err
+		return ctx, nil, err
 	}
 
 	// create the new filesystem map
@@ -558,14 +578,17 @@ func provisionContext(newCfg *Config, replaceAdminServer bool) (Context, error) 
 		return nil
 	}()
 	if err != nil {
-		return ctx, err
+		return ctx, nil, err
 	}
 
-	// start the admin endpoint (and stop any prior one)
+	// provision the admin endpoint for the new configuration, but do
+	// not publish it yet: it is only committed after every app starts
+	// successfully, so a failing configuration cannot take over - or
+	// take down - the endpoint that is still serving the last good one
 	if replaceAdminServer {
-		err = replaceLocalAdminServer(newCfg, ctx)
+		adminChange, err = prepareLocalAdminServer(newCfg, ctx)
 		if err != nil {
-			return ctx, fmt.Errorf("starting caddy administration endpoint: %v", err)
+			return ctx, nil, fmt.Errorf("starting caddy administration endpoint: %v", err)
 		}
 	}
 
@@ -578,7 +601,7 @@ func provisionContext(newCfg *Config, replaceAdminServer bool) (Context, error) 
 		}
 		return nil
 	}()
-	return ctx, err
+	return ctx, adminChange, err
 }
 
 // ProvisionContext creates a new context from the configuration and provisions storage
@@ -587,7 +610,8 @@ func provisionContext(newCfg *Config, replaceAdminServer bool) (Context, error) 
 // use to ensure a fully functional caddy instance.
 // EXPERIMENTAL: While this is public the interface and implementation details of this function may change.
 func ProvisionContext(newCfg *Config) (Context, error) {
-	return provisionContext(newCfg, false)
+	ctx, _, err := provisionContext(newCfg, false)
+	return ctx, err
 }
 
 // finishSettingUp should be run after all apps have successfully started.

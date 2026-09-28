@@ -91,6 +91,17 @@ func (adminLoad) handleLoad(w http.ResponseWriter, r *http.Request) error {
 	}
 	body := buf.Bytes()
 
+	// a load always replaces the whole configuration, so an empty
+	// body is never a meaningful request; reject it before adaptation
+	// could turn it into anything, so it can never blank out the
+	// currently-running ("last known good") configuration
+	if len(bytes.TrimSpace(body)) == 0 {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("loading config: request body is empty; a full configuration document is required"),
+		}
+	}
+
 	// if the config is formatted other than Caddy's native
 	// JSON, we need to adapt it before loading it
 	if ctHeader := r.Header.Get("Content-Type"); ctHeader != "" {
@@ -109,6 +120,37 @@ func (adminLoad) handleLoad(w http.ResponseWriter, r *http.Request) error {
 			_, _ = w.Write(respBody) //nolint:gosec // false positive: no XSS here
 		}
 		body = result
+	}
+
+	// fully decode the document ourselves instead of letting the
+	// loader treat it as an untyped value: an explicit null (or any
+	// non-object document) would otherwise tear down the running
+	// config, while truncated JSON or trailing data must be reported
+	// with the same decoding error expression as /config, leaving the
+	// currently-running configuration completely untouched
+	var doc any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		if jsonErr, ok := err.(*json.SyntaxError); ok {
+			err = fmt.Errorf("decoding request body: %w, at offset %d", jsonErr, jsonErr.Offset)
+		} else {
+			err = fmt.Errorf("decoding request body: %w", err)
+		}
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("loading config: %v", err),
+		}
+	}
+	if doc == nil {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("loading config: decoding request body: configuration must be a JSON object, got null"),
+		}
+	}
+	if _, ok := doc.(map[string]any); !ok {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("loading config: decoding request body: configuration must be a JSON object"),
+		}
 	}
 
 	forceReload := r.Header.Get("Cache-Control") == "must-revalidate"
