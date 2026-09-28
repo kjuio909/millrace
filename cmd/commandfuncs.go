@@ -248,11 +248,31 @@ func cmdRun(fl Flags) (int, error) {
 	// we don't use 'else' here since this value might have been changed in 'if' block; i.e. not mutually exclusive
 	var configFile string
 	var adapterUsed string
+	// startupConfig is non-nil when the startup file was set aside in
+	// favor of a restored autosave; it is the fallback if the restored
+	// document turns out not to start
+	var startupConfig []byte
 	if !resumeFlag {
 		config, configFile, adapterUsed, err = LoadConfig(configFlag, configAdapterFlag)
 		if err != nil {
 			logBuffer.FlushTo(defaultLogger)
 			return caddy.ExitCodeFailedStartup, err
+		}
+
+		// unless configuration persistence was explicitly turned off for the
+		// startup configuration (or this is an explicit --resume), a config
+		// successfully pushed via the admin API during a previous run takes
+		// precedence over the older startup file: the last running version
+		// is restored so a restart comes back to where the process left off
+		if restored, ok := caddy.RestoreAutosavedConfig(config); ok {
+			startupConfig = config
+			config = restored
+			// the startup file is no longer the source of truth; do not
+			// register it for file watching or signal-triggered reloads,
+			// which would otherwise push the stale file version back over
+			// the restored configuration
+			configFile = ""
+			adapterUsed = ""
 		}
 	}
 
@@ -281,6 +301,14 @@ func cmdRun(fl Flags) (int, error) {
 
 	// run the initial config
 	err = caddy.Load(config, true)
+	if err != nil && startupConfig != nil {
+		// the restored autosaved configuration could not start; fall back
+		// to the explicit startup file rather than refusing to run, so a
+		// corrupt or incompatible persisted copy never wedges the process
+		logger.Error("restored autosaved configuration failed to load; falling back to startup configuration",
+			zap.Error(err))
+		err = caddy.Load(startupConfig, true)
+	}
 	if err != nil {
 		logBuffer.FlushTo(defaultLogger)
 		return caddy.ExitCodeFailedStartup, fmt.Errorf("loading initial config: %v", err)

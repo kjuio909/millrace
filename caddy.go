@@ -168,6 +168,12 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
 	rawCfgMu.Lock()
 	defer rawCfgMu.Unlock()
 
+	// a load with no previously-running configuration is a process-startup
+	// load rather than an online load via the admin API; persistence is
+	// established at a different point for the two (see
+	// unsyncedDecodeAndRun)
+	initialLoad := len(rawCfgJSON) == 0
+
 	if ifMatchHeader != "" {
 		// expect the first and last character to be quotes
 		if len(ifMatchHeader) < 2 || ifMatchHeader[0] != '"' || ifMatchHeader[len(ifMatchHeader)-1] != '"' {
@@ -244,7 +250,7 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
 
 	// load this new config; if it fails, we need to revert to
 	// our old representation of caddy's actual config
-	err = unsyncedDecodeAndRun(newCfg, true)
+	err = unsyncedDecodeAndRun(newCfg, true, initialLoad)
 	if err != nil {
 		if len(rawCfgJSON) > 0 {
 			// restore old config state to keep it consistent
@@ -334,7 +340,15 @@ func indexConfigObjects(ptr any, configPath string, index map[string]string) err
 // instead. A write lock on rawCfgMu is required! If
 // allowPersist is false, it will not be persisted to disk,
 // even if it is configured to.
-func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
+//
+// initialLoad marks a process-startup load (no configuration was
+// running before it). The on-disk autosave is updated on the same
+// boundary as the running configuration: an online load keeps the
+// previously persisted version until the new configuration has fully
+// started, while a startup load publishes its copy before any app
+// starts (rolling it back if the start fails), so a restart can never
+// resurrect a version newer or older than the one that established it.
+func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist, initialLoad bool) error {
 	// remove any @id fields from the JSON, which would cause
 	// loading to break since the field wouldn't be recognized
 	strippedCfgJSON := RemoveMetaFields(cfgJSON)
@@ -359,9 +373,67 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 		return fmt.Errorf("recursive config loading detected: pulled configs cannot pull other configs without positive load_delay")
 	}
 
+	// whether this configuration wants a copy of itself kept on disk;
+	// a null/empty configuration is "no configuration" and never touches
+	// the autosave file in either direction
+	hasConfig := newCfg != nil
+	persistEnabled := hasConfig && allowPersist &&
+		(newCfg.Admin == nil ||
+			newCfg.Admin.Config == nil ||
+			newCfg.Admin.Config.Persist == nil ||
+			*newCfg.Admin.Config.Persist)
+
+	// A process-startup load has no in-memory last-good version to fall
+	// back to, so the persisted copy must describe the configuration
+	// before any of its apps start: if the start then fails, the process
+	// exits and a later restart must not pick up this never-running
+	// version, so the pre-existing copy is restored (or removed if none
+	// existed). A startup configuration with persistence disabled removes
+	// any copy left by a previous, persistence-enabled round, since a
+	// restart in this round must come back to its startup file. An
+	// online load instead leaves the old copy untouched until after the
+	// new configuration has fully started below, which keeps the last
+	// good version on disk across a failed load.
+	var prevAutosave []byte
+	var hadPrevAutosave bool
+	if initialLoad && hasConfig && allowPersist {
+		if prev, readErr := os.ReadFile(ConfigAutosavePath); readErr == nil {
+			prevAutosave = prev
+			hadPrevAutosave = true
+		} else if !errors.Is(readErr, fs.ErrNotExist) {
+			Log().Error("unable to read previous config autosave",
+				zap.String("file", ConfigAutosavePath),
+				zap.Error(readErr))
+		}
+		if persistEnabled {
+			if saveErr := writeConfigAutosave(cfgJSON); saveErr != nil {
+				Log().Error("unable to autosave config before startup",
+					zap.String("file", ConfigAutosavePath),
+					zap.Error(saveErr))
+			}
+		} else if removeErr := os.Remove(ConfigAutosavePath); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+			Log().Error("unable to remove disabled config autosave",
+				zap.String("file", ConfigAutosavePath),
+				zap.Error(removeErr))
+		}
+	}
+
 	// run the new config and start all its apps
 	ctx, err := run(newCfg, true)
 	if err != nil {
+		if initialLoad && hasConfig && allowPersist {
+			if hadPrevAutosave {
+				if saveErr := writeConfigAutosave(prevAutosave); saveErr != nil {
+					Log().Error("unable to restore previous config autosave after failed startup",
+						zap.String("file", ConfigAutosavePath),
+						zap.Error(saveErr))
+				}
+			} else if removeErr := os.Remove(ConfigAutosavePath); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+				Log().Error("unable to remove config autosave of failed startup",
+					zap.String("file", ConfigAutosavePath),
+					zap.Error(removeErr))
+			}
+		}
 		return err
 	}
 
@@ -374,28 +446,26 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 	// Stop, Cleanup each old app
 	unsyncedStop(oldCtx)
 
-	// autosave a non-nil config, if not disabled
-	if allowPersist &&
-		newCfg != nil &&
-		(newCfg.Admin == nil ||
-			newCfg.Admin.Config == nil ||
-			newCfg.Admin.Config.Persist == nil ||
-			*newCfg.Admin.Config.Persist) {
-		dir := filepath.Dir(ConfigAutosavePath)
-		err := os.MkdirAll(dir, 0o700)
-		if err != nil {
-			Log().Error("unable to create folder for config autosave",
-				zap.String("dir", dir),
-				zap.Error(err))
-		} else {
-			err := os.WriteFile(ConfigAutosavePath, cfgJSON, 0o600)
-			if err == nil {
-				Log().Info("autosaved config (load with --resume flag)", zap.String("file", ConfigAutosavePath))
-			} else {
+	// an online load only touches the persisted copy now, after the new
+	// configuration started successfully and took over: a failed load
+	// never reaches this point, so the copy on disk - just like the
+	// running configuration - stays the last successful version. A
+	// successful configuration with persistence disabled additionally
+	// removes the copy of the previous version, since a later restart in
+	// this round must return to the startup file rather than it.
+	if !initialLoad && hasConfig {
+		if persistEnabled {
+			if saveErr := writeConfigAutosave(cfgJSON); saveErr != nil {
 				Log().Error("unable to autosave config",
 					zap.String("file", ConfigAutosavePath),
-					zap.Error(err))
+					zap.Error(saveErr))
+			} else {
+				Log().Info("autosaved config (load with --resume flag)", zap.String("file", ConfigAutosavePath))
 			}
+		} else if removeErr := os.Remove(ConfigAutosavePath); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+			Log().Error("unable to remove config autosave after persistence was disabled",
+				zap.String("file", ConfigAutosavePath),
+				zap.Error(removeErr))
 		}
 	}
 
